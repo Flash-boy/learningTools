@@ -6,5 +6,7 @@
 - [cmake.md](buildsTool/cmake.md)包括CMakeLists.txt的一些使用指令结合了8个demo
 - [learning-cmake](buildsTool/learning-cmake/README.md)这个文件夹包含  cmake.md的8个demo     
 - [gdb.md](buildsTool/gdb.md)包括gdb的一些常用命令结合实践    
+### Git  
+- [git.md](Git/git.md)包括git的原理和命令使用      
 ### Pictures
 写各种.md文件的图片源文件

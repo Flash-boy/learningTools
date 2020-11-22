@@ -10,6 +10,6 @@
 - [git.md](Git-Vim/git.md)包括git的原理和命令使用   
 - [vim.md](Git-Vim/Vim.md)包括vim的一些常用命令    
 ### mudou
-- [mudou](mudou/mudou.md)包括mudou网络库的阅读技巧和源码分析   
+- [mudou.md](mudou/mudou.md)包括mudou网络库的阅读技巧和源码分析   
 ### Pictures
 写各种.md文件的图片源文件

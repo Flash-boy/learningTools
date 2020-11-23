@@ -9,17 +9,14 @@ mudou网络库是我当时学习某个开源项目叫做[Flamingo](https://githu
 我也是通过阅读这个源码才了解到mudou库，这也是我学习到的第一个开源项目。所有写一遍文章，来记录自己对mudou库的理解，可能不是很到位，我会在给一张建议阅读mudou网络库的代码顺序，我觉得一个好的阅读顺序是学习源码的好方式。      
 ```
 1.首先是base文件夹    
-Singleton.h->Timestamp.h/cpp->ConfigFileReader.h/.cpp->
+Singleton.h->Timestamp.h/cpp->ConfigFileReader.h/cpp->AsyncLog.h/cpp->Buffer.h/cpp->Endian.h->Callbacks.h->Sockets.h/cpp->InetAddress.h/cpp->    
+channel.h/cpp->
 ```  
 以上只是个人的阅读顺序，希望你能有一个大概的网络API概念，包括套接字，bind(),listen(),connect()等函数，知道是干什么用的。然后阅读源码时候你会发现大佬写的代码都是很规范很漂亮的，文件夹的命名和文件的命名都是很规范，都能给你一定信息。我会带着上述的代码阅读顺序，逐个解析各个文件的作用，包括函数，和如何和其他连接起来的。    
 ### 阅读源码    
 > 我觉得看懂一个类的作用和实现首先需要看的是类声明，先看类的成员变量，再看类的函数声明，再看类的成员函数的实现(细节)，最后总结归纳出该类的作用和对外接口。所以我会一次解读每个文件中每个类。每个类的分析都会有，类声明分析、重要类函数实现分析、类作用和对外接口，三个部分。    
 
 
-## Singleton.h   
-**1.类声明分析**    
-**2.重要类函数实现分析**   
-**3.类作用及对外接口总结**  
 
 ## Singleton.h   
 **1.类声明分析**    
@@ -136,3 +133,180 @@ int setConfigValue(const char* name, const char*  value);   # 设置对应的key
 这里面的LOGI(...)等形式的函数就可以输出日志到对应的文件。里面的技术主要是一个异步日志，采用一个线程专门写日志到文件，在其他调用LOGI(...)函数中只是包装好日志信息到内存链表中，然后交给线程处理函数写日志到文件。     
 
 
+## Buffer.h和Buffer.cpp        
+**1.类声明分析**    
+![buffer](../Pictures/mudou_buffer1.png)    
+整个buffer其实就是由一个vector组成的空间，然后外加两个索引分别表示可读和可写     
+**2.重要类函数实现分析**    
+![buffer](../Pictures/mudou_buffer2.png)     
+一个vector被readerIndex_,writerIndex_分隔成3部分，第一部分为前置保留的区域[0,readerIndex_)，然后就是[readerIndex_,writerIndex_)表示的可读部分，最后就是[writerIndex,size)可写部分。  
+通过移动可读和可写索引来向buffer中写或者读数据。       
+```
+explicit Buffer(size_t initialSize = kInitialSize)
+			: buffer_(kCheapPrepend + initialSize),
+			readerIndex_(kCheapPrepend),
+			writerIndex_(kCheapPrepend)   #显式构造函数，默认前置的空间大小是8字节，初始化空间为1024字节所以开始时buffer_大小为1032字节。    
+const char* peek() const     #可读数据的指针   
+const char* findString(const char* targetStr) const     #在可读区域查找字符串，找到返回，没找到返回nullptr    
+const char* findCRLF() const     #在可读范围内查找"\r\n"    
+const char* findCRLF(const char* start) const     #在start(必须在可读区域)到可读区域末尾查找"\r\n"     
+bool retrieve(size_t len)     #读取一定数量字节     
+std::string retrieveAsString(size_t len)    #以字符串的形式读取一定字节    
+void append(const std::string& str)     #写入字符串     
+void appendInt64(int64_t x)             #以网络字节序写入buffer一个Int64     
+int64_t readInt64()                     #以从网络字节序读出一个Int64为主机字节序     
+bool prepend(const void* /*restrict*/ data, size_t len)    #在可读区域前面写入数据    
+void shrink(size_t reserve)             #调整整个buffer到合适大小   
+int32_t Buffer::readFd(int fd, int* savedErrno)    #最重要的一个函数从fd中读数据到buffer中如果可写区域小于65536则开另外一个数组临时保存fd中的数据然后再写入buffer中，确保能读完不大于65536个自己的fd数据             
+```
+**3.类作用及对外接口总结**    
+Buffer是整个mudou网络库用来存储数据的中间类，提供了很多适合网络编程的接口，向readFd()等，都是针对网络库设计的Buffer.其实也很简单就是一个vector，然后两个变量记录了索引，将整个区间可读，可写，还有前置区域都划分的很清楚。     
+
+## Endian.h        
+**1.类声明分析**    
+```
+inline uint64_t hostToNetwork64(uint64_t host64)    
+inline uint32_t hostToNetwork64(uint32_t host32)       
+inline uint16_t hostToNetwork64(uint16_t host16)    
+inline uint64_t networkToHost64(uint64_t net64)     
+inline uint32_t networkToHost64(uint32_t net32)          
+inline uint16_t networkToHost16(uint16_t net16)        
+```
+**2.重要类函数实现分析**     
+为不同主机和网络字节序，统一了接口，有64位，32位，16位，主机字节序和网络字节序的互换。确保网络编程数据的正常交换。    
+**3.类作用及对外接口总结**    
+根据不同的数据需要调用不同的函数，跟后续的Socket联合使用。    
+
+
+
+## Callbacks.h       
+**1.类声明分析**    
+```
+template<typename To, typename From>
+inline To implicit_cast(From const& f)
+{
+    return f;
+}                   #隐式转化函数
+
+template<typename To, typename From>    
+inline To down_cast(From* f)       #向下转化，内部是调用dynamic_cast   
+
+emplate<typename To, typename From>
+inline std::shared_ptr<To> down_pointer_cast(const std::shared_ptr<From> & f)         #指针向下转化，内部也是调用dynamic_cast    
+```
+**2.重要类函数实现分析**    
+```
+
+    class Buffer;
+    class TcpConnection;
+    typedef std::shared_ptr<TcpConnection> TcpConnectionPtr;
+    typedef std::function<void()> TimerCallback;
+    typedef std::function<void(const TcpConnectionPtr&)> ConnectionCallback;
+    typedef std::function<void(const TcpConnectionPtr&)> CloseCallback;
+    typedef std::function<void(const TcpConnectionPtr&)> WriteCompleteCallback;
+    typedef std::function<void(const TcpConnectionPtr&, size_t)> HighWaterMarkCallback;
+
+    // the data has been read to (buf, len)
+    typedef std::function<void(const TcpConnectionPtr&, Buffer*, Timestamp)> MessageCallback;
+
+    void defaultConnectionCallback(const TcpConnectionPtr& conn);
+    void defaultMessageCallback(const TcpConnectionPtr& conn, Buffer* buffer, Timestamp receiveTime);
+```    
+主要定义了一些回调函数类型，主要是建立连接的ConnectionCallback,定时器回调函数类型TimerCallback,关闭连接回调类型closeCallback,写数据完成WriteCompleteCallback,还有最重要的收发数据回调MessageCallback,然后有两个默认的回调函数。一个是建立连接的时候需要调用，另外一个是收发数据时候需要调用。     
+
+**3.类作用及对外接口总结**     
+整个文件定义了一些回调函数别名，和一些类型转化，类型转化主要有两个，还有一些回调函数，主要是建立连接和消息处理的回调函数。    
+
+
+## Sockets.h和Sockets.cpp       
+**1.类声明分析**    
+这个主要是对socket的封装     
+```
+explicit Socket(int sockfd) : sockfd_(sockfd)    #显示构造函数
+SOCKET fd() const { return sockfd_; }            
+bool getTcpInfoString(char* buf, int len) const; #得到Tcp连接信息 
+void bindAddress(const InetAddress& localaddr)   #socketFd绑定某个地址
+void listen();   							     #socket转化为监听套接字
+int accept(InetAddress* peeraddr);     			 #accept()函数的包装，接收某个连接，返回连接套接字     
+void shutdownWrite();                            #关闭套接字写
+void setTcpNoDelay(bool on);    				 #设置连接属性
+void setReuseAddr(bool on);     
+void setReusePort(bool on);    
+void setKeepAlive(bool on);     
+private:
+	const SOCKET sockfd_;           #唯一成员变量一个常量的普通socketFd
+```
+**2.重要类函数实现分析**    
+```
+SOCKET createOrDie();  #创建非阻塞fd,失败就结束进程(函数名的OrDie就是这个意思)
+SOCKET createNonblockingOrDie(); #创建非阻塞fd，失败就结束进程
+
+void setNonBlockAndCloseOnExec(SOCKET sockfd);  #设置socket属性为非阻塞和在子程序中关闭
+
+void setReuseAddr(SOCKET sockfd, bool on);     #socket重复使用某个地址
+void setReusePort(SOCKET sockfd, bool on);	   #socket重复使用某个端口    
+
+SOCKET connect(SOCKET sockfd, const struct sockaddr_in& addr); #连接某个地址
+void bindOrDie(SOCKET sockfd, const struct sockaddr_in& addr); #绑定某个地址到socket   
+SOCKET accept(SOCKET sockfd, struct sockaddr_in* addr);   #接收连接到某个socket的连接   
+int32_t read(SOCKET sockfd, void *buf, int32_t count);    #从套接字读数据
+ssize_t readv(SOCKET sockfd, const struct iovec *iov, int iovcnt);#从套接字读数据到多个内存    
+int32_t write(SOCKET sockfd, const void *buf, int32_t count);#向套接字写数据
+void close(SOCKET sockfd);  #关闭套接字内部也是调用全局close()
+void shutdownWrite(SOCKET sockfd); #停止套接字数据传输，内部调用shutdown()函数    
+
+void toIpPort(char* buf, size_t size, const struct sockaddr_in& addr);#某个地址的ip和port转化为字符串    
+void toIp(char* buf, size_t size, const struct sockaddr_in& addr);#某个地址的ip转化为字符串    
+void fromIpPort(const char* ip, uint16_t port, struct sockaddr_in* addr);# 从字符串和port，生成一个地址     
+
+int getSocketError(SOCKET sockfd);#得打某个套接字相关的错误   
+
+const struct sockaddr* sockaddr_cast(const struct sockaddr_in* addr);#地址转化sockaddr和sockaddr_in之间的转化
+struct sockaddr* sockaddr_cast(struct sockaddr_in* addr);
+const struct sockaddr_in* sockaddr_in_cast(const struct sockaddr* addr);
+struct sockaddr_in* sockaddr_in_cast(struct sockaddr* addr);
+
+struct sockaddr_in getLocalAddr(SOCKET sockfd);#得到本地地址    
+struct sockaddr_in getPeerAddr(SOCKET sockfd);#得到对端地址
+bool isSelfConnect(SOCKET sockfd);#判断是不是自己连接自己   
+```   
+和网络Socket相关的一些函数。    
+**3.类作用及对外接口总结**    
+该类只是对普通socket的包装，然后就是对网络变成的bind(),listen(),connect(),accept()函数的封装。    
+
+
+
+## InetAddress.h和InetAddress.cpp        
+**1.类声明分析**     
+```
+explicit InetAddress(uint16_t port = 0, bool loopbackOnly = false);
+InetAddress(const std::string& ip, uint16_t port);
+InetAddress(const struct sockaddr_in& addr);
+std::string toIp() const;
+std::string toIpPort() const;
+uint16_t toPort() const;
+const struct sockaddr_in& getSockAddrInet() const { return addr_; }
+void setSockAddrInet(const struct sockaddr_in& addr) { addr_ = addr; }
+
+uint32_t ipNetEndian() const { return addr_.sin_addr.s_addr; }
+uint16_t portNetEndian() const { return addr_.sin_port; }
+static bool resolve(const std::string& hostname, InetAddress* result); 
+private:
+    struct sockaddr_in      addr_;
+```  
+该类只是sockaddr_in的包装    
+**2.重要类函数实现分析**   
+3种构造函数都可以构造一个网络地址，可以用本地地址，也可以从ip.port构造，也可以从一个sockaddr_in地址构造，resolve()是解析主机名然后生成一个地址。  
+**3.类作用及对外接口总结**    
+这个类主要是对地址的封装，方便一些接口和对象的统一使用     
+
+------------------------------------------------------------------------ 
+------------------------------------------------------------------------
+
+------------------------------------------------------------------------
+现在才是整个网络库的基础，包括一些常用概念channel,EventLoop,Poller等。   
+
+## Channel.h和Channel.cpp       
+**1.类声明分析**    
+**2.重要类函数实现分析**   
+**3.类作用及对外接口总结**  

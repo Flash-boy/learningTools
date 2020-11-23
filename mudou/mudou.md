@@ -10,7 +10,9 @@ mudou网络库是我当时学习某个开源项目叫做[Flamingo](https://githu
 ```
 1.首先是base文件夹    
 Singleton.h->Timestamp.h/cpp->ConfigFileReader.h/cpp->AsyncLog.h/cpp->Buffer.h/cpp->Endian.h->Callbacks.h->Sockets.h/cpp->InetAddress.h/cpp->    
-channel.h/cpp->
+channel.h/cpp->Poller.h/cpp->PollPoller.h/cpp->EpollPoller.h/cpp->SelectPoller.h/cpp->    
+Timer.h/cpp->TimerId.h->TimerQueue.h/cpp->      
+
 ```  
 以上只是个人的阅读顺序，希望你能有一个大概的网络API概念，包括套接字，bind(),listen(),connect()等函数，知道是干什么用的。然后阅读源码时候你会发现大佬写的代码都是很规范很漂亮的，文件夹的命名和文件的命名都是很规范，都能给你一定信息。我会带着上述的代码阅读顺序，逐个解析各个文件的作用，包括函数，和如何和其他连接起来的。    
 ### 阅读源码    
@@ -308,5 +310,129 @@ private:
 
 ## Channel.h和Channel.cpp       
 **1.类声明分析**    
+![](../Pictures/mudou_Channel1.png)     
+可以看到这里面的成员变量，其实channel是整个mudou网络库应该是最底层的一个抽象出来的类，这个类主要的是为了处理socket不同事件，例如可读，可写，或者错误之类的事件，channel，就好比一个通道，socket描述了一个连接的一方，一个channel就绑定了一个socket，然后进行相应的数据处理。      
+所以可以看到某个channel肯定是绑定某个socket的，那么就必须有fd_,同时采用的是one thread,one loop 的模型，所以这个channel肯定是属于某个loop_,还有这个socket，需要加入poll，或者epoll模型中监听某个事件，所以有events_,然后就是结果所以有revents_,最后就是每个channel是要被上层功能所包含的，例如TcpConnection,那么该channel是否绑定到某个类上，就需要指针tie_,然后就是可读，可写，关闭，错误回调函数，其中可读的都是有时间戳为参数的。     
 **2.重要类函数实现分析**   
-**3.类作用及对外接口总结**  
+```
+Channel::Channel(EventLoop* loop, int fd__)    #构造函数，绑定某个fd,和属于某个loop     
+update()         #在该loop中的poll模型中更新监控的事件   
+enableReading()  #让该fd在poll模型中监控可读事件    
+disableAll()     #让该fd移除对应的poll模型中监控事件，就是啥也不监控   
+remove()         #从属于的poll模型中移除该channel绑定的事件   
+handleEvent()    #根据poll模型中revent_调用对应的函数执行     
+reventsToString() #把revents_转化为字符串，方便日志的记录
+```
+**3.类作用及对外接口总结**   
+一个channel对应一个socket,属于某个loop,可以设置不同的待监控事件，根据结果，调用不同的设置的回调函数处理相应的事件发生，最主要的函数应该就是update()，它会调用loop中的poll模型中的更新channel函数去更新相应的channel,然后如果channel被激活，也就是revents_有事件，那么会调用handleEvent()函数去处理相应的事件。      
+
+--------------------------------------------------------------------
+
+## Poller.h和Poller.cpp       
+下面提到的几个类都是以该类为基类，派生出来的，是为了常用的三种非阻塞IO模型，select,poll,epoll提供一些共同的接口函数也就是poll()函数。     
+**1.类声明分析**    
+![poller](../Pictures/mudou_Poller.png)     
+可以看到这是一个有纯虚函数的抽象基类，是为了给后面介绍的三种IO模型做继承，然后提供了这个抽象基类的接口      
+**2.重要类函数实现分析**     
+```
+Timestamp poll(int timeoutMs,ChannelList* activeChannels)   #主要调用函数，返回相应事件被触发的channel，也就是说最后得到的channel说明该channel对应的socketFd上有相应的事件需要处理。    
+bool updateChannel(Channel* channel)   #在对应的poll模型中更新channel
+void removerChannel(Channel* channel)  #在对应的poll模型中移除某个channel   
+bool hasChannel(Channel* channel)      #在对应的poll模型中是否有某个channel    
+```
+**3.类作用及对外接口总结**     
+以上是一个抽象基类，在每一个继承的类中，都会根据对应的模型重载相应的函数，最后对外的接口就是这几个函数。     
+
+## PollPoller.h和PollPoller.cpp     
+利用poll模型,和select模型类似也是轮询一些fd，然后将触发事件的fd结果保存        
+**1.类声明分析**    
+![poll](../Pictures/mudou_poll1.png)    
+可以看到poll模型中有两个数据一个是vector,保存了polldf，还有一个是每一个fd所对应的Channel    
+**2.重要类函数实现分析**     
+```
+PollPoller(EventLoop* loop)     #构造函数一个EventLoop含有一个poll   
+fillActiveChannels(int numEvents,ChannelList* activeChannels) const #根据poll()函数中被触发的事件填充activeChannels    
+updateChannel(Channel* channel)   #如果channel对应的索引是-1表明是一个新的channel,则直接加入到poll中的pollfds_和channels_中，否则就是一个存在的则更新它    
+removeChannel(Channel* channel)  #移除某个已经在poll中的channel,该channel必须对应的是NoneEvent才能被移除，会在vector中将该channel与最后一个channel交换位置再移除，总是移除vector中最后一个，同时删除掉channels_中     
+poll(int timeOutMs,ChannelList* activeChannels) #内部调用::poll()函数监控pollfds_中的socketFd,同时返回相应事件的通道和对应的时间     
+```
+**3.类作用及对外接口总结**     
+Poll类是对poll模型的类的封装，其中的poll()函数正是对poll模型中的::poll()函数进行的封装处理。    
+
+## EpollPoller.h和EpollPoller.cpp  
+epoll模型是对poll模型的改进每个epoll对象控制着事件的加入和删除     
+**1.类声明分析**     
+![epoll](../Pictures/mudou_epoll1.png)       
+可以看到也是有两个重要的数据成员events_,因为epoll模型是直接返回对应的事件所以相对的效率会高很多，不需要向poll那样对每一个event都要看是否触发，同样也有一个channels_,同时还有一个epollfd_，这是标识epoll对象的。    
+**2.重要类函数实现分析**       
+```
+EpollPoller(EventLoop* loop)  #构造函数，属于某个loop，同时创建一个epoll对象  
+updateChannel(Channel* channel)  # 更新某个channel
+removeChannel(Channel* channel)  # 移除某个channel    
+hasChannel(Channel* channel)     #epoll模型中是否有某个channel   
+Timestamp poll(int timeoutMs,ChannelList* activeChannels) #调用内部epoll_wait()函数    
+```
+**3.类作用及对外接口总结**       
+该类是对epoll模型的封装，使用和其他的模型一样，对外接口类似都是poll()函数内部执行::epoll_wait()功能     
+
+## SelectPoller.h和SelectPoller.cpp    
+select模型的封装实现        
+**1.类声明分析**    
+![select](../Pictures/mudou_select1.png)    
+用的类和epoll类似只是某些细节上不一样   
+**2.重要类函数实现分析**       
+```
+poll(int timeoutMs,channelList* activeChannels)  #内部调用select()函数轮询fd，将fd加入对应的可读，可写集合      
+fillActiveChannels(int numEvents, ChannelList* activeChannels, fd_set& readfds, fd_set& writefds)    #判断可读可写事件中是否有某个channel，有就加入到激活channels中
+```
+**3.类作用及对外接口总结**       
+利用select模型，去判断事件是否被触发，select模型是有两个可读，可写集合，轮询监控这两个集合     
+
+--------------------------------------------------------------------
+
+## Timer.h和Timer.cpp    
+从前面我们就能推断一个loop中应该有一个poll模型，poll模型主要监控的是网络读写事件，我们还有一些其他事件同样是需要处理的，例如定时器事件，该类就表示一个定时器事件。      
+**1.类声明分析**   
+![timer](../Pictures/mudou_timer.png)     
+定时器类主要就是在某个时刻触发某事件，该类支持某时刻触发某事件并且间隔多少事件，触发某事件多少次     
+成员主要包括一个回调函数，过期时间和一个时间间隔，重复次数，还有一个序列号表示是当前类的多少个对象
+**2.重要类函数实现分析**       
+```
+Timer(const TimerCallback& cb, Timestamp when, int64_t interval, int64_t repeatCount = -1);    #定时器构造函数-1，表示一直重复下去     
+void run();                   #实际调用函数，表示跑定时器事件函数
+```
+**3.类作用及对外接口总结**    
+该类是一个定时器类，一个对象表示一个定时器事件，一般只用该类创建对象，加入下面要分析的定时器队列类对象中     
+
+## TimerId.h   
+**1.类声明分析**   
+![timerId](../Pictures/mudou_timerId.png)    
+**2.重要类函数实现分析**    
+通过序列号和一个定时器对象指针构造一个TimerId对象       
+**3.类作用及对外接口总结**     
+对Timer对象的一个封装，只是单纯的一层过渡，方便使用     
+
+## TimerQueue.h和TimerQueue.cpp    
+定时器队列类，每个loop中应当都有一个该对象,同时TimerQueue掌管着所以Timer对象的构造，析构    
+**1.类声明分析**   
+![TimerQueue](../Pictures/mudou_timerQueue.png)     
+**2.重要类函数实现分析**    
+```
+TimerId addTimer(const TimerCallback& cb, Timestamp when, int64_t interval, int64_t repeatCount);   #添加定时器内部会new一个定时器对象，然后因为set集合的线程不安全，所以会调用addTimerInLoop()函数，在loop中insert一个对象到set中保证在线程安全    
+removeTimer(TimerId timerId)   #从set中移除一个定时器内部也是调用removeTimerInLoop()     
+cancelTimer(TimerId timerId,bool offf)  #将一个定时器对象设置为开/关，内部也会调用cancelTimerInLoop()     
+doTimer()  #定时器事件，如果当前时间>=定时器对象定时时间，则调用Timer->run()函数做该定时器事件    
+           #同时采用set是可以利用定时器事件开始时间作为set的key键，从最早时间开始直到当前时间都是要做定时器事件，加快效率
+```
+**3.类作用及对外接口总结**     
+TimerQueue是一个定时器类，用set保存每一个定时器对象包括定时器对象，然后比较当前时间和定时器时间，判断是否做相应的事件。   
+貌似remove定时器对象和定时器重复次数变为移除set的Timer没有delete？内存泄露？           
+
+------------------------------------------------------------------------
+
+
+
+
+
+
+

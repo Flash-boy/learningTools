@@ -430,6 +430,123 @@ TimerQueue是一个定时器类，用set保存每一个定时器对象包括定�
 
 ------------------------------------------------------------------------
 
+## ProtocalStream.h和ProtocalStream.cpp    
+二进制协议流读写类，用于服务器内部通讯使用         
+**1.类声明分析**   
+![stream](../Pictures/mudou_Stream1.png)    
+![stream](../Pictures/mudou_Stream2.png)    
+一个是编码一个是解码的类     
+**2.重要类函数实现分析**     
+二进制包采用“包头+包体”包头包括包体的长度，包体则是真正的数据       
+```
+write7BitEncodeed(uint32_t value,std::string& buf)  #将32位数字7位一个编码，从低位开始，编码后每个字节若是最高位是1表示还有数据，若是最高位为0表示没有数据     
+# 例如一个uint32_t的数据0x1010101110110，4个字节的数据则会从低位开始7位拼成一个字节，所以会变成第一个字节0x11110110,第二个字节为0x00101010，只需要2个字节就可以表示一个4字节数，当然这是号情况，最坏的是最高位不是0，那么就需要5个字节来表示一个4字节数      
+void read7BitEncoded(const char* buf, uint32_t len, uint32_t& value)     #同理解码这样的数据然后组成一个4字节32位的数      
+```  
+先看BinaryStreamWriter类，这个主要是向某个字符串对象string中写入编码过的数据   
+```
+BinaryStreamWriter(string* data) #构造函数清空string，然后追加一个包头和校验和长度。留给后续填入     
+bool WriteCString(const char* str, size_t len); #写入C风格字符串，追加字符串长度+字符本身，字符串长度被编码过
+bool WriteString(const std::string& str);		#写入string字符串，追加字符串长度+字符串本身
+bool WriteDouble(double value, bool isNULL = false); #写入doubel，转化为字符串再写入
+bool WriteInt64(int64_t value, bool isNULL = false); #写入64位数，转化位字符串再写入
+bool WriteInt32(int32_t i, bool isNULL = false); #写入32位数
+bool WriteShort(short i, bool isNULL = false);   #写入short数
+bool WriteChar(char c, bool isNULL = false);     #写入一个字符   
+void Flush()                 #把包体数据长度写入前面保留的包头中     
+void Clear();                                    #清空包体数据
+```    
+BinaryStreamReader则是解析上面编码的字符串数据cur指针，在整个读取过程中不断移动         
+```
+BinaryStreamReader(const char* ptr, size_t len);   #构造函数ptr是指向包头的指针，cur则是指向包体读取数据的指针，len则是整个包的数据长度     
+bool ReadLength(size_t& len);    #将字符串的长度读取出来同时移动cur指针指向实际数据     
+bool ReadLengthWithoutOffset(size_t& headlen, size_t& outlen);  #将字符串实际长度和保留字符串长度的头大小读取出来，不移动cur指针    
+bool ReadString(std::string* str, size_t maxlen, size_t& outlen);#读处编码的字符串
+bool ReadCString(char* str, size_t strlen, size_t& len);#读出编码的c风格字符串   
+bool ReadInt32(int32_t& i);  #读出32位数，编码时转化为网络字节序，解码相应的转化为主机字节序    
+bool ReadInt64(int64_t& i);  #读出64位数
+bool ReadShort(short& i);	 #读出short数
+bool ReadChar(char& c);		 #读出一个字符
+size_t ReadAll(char* szBuffer, size_t iLen) const; #只是读取ptr的数据并没有解码    
+bool IsEnd() const;          #是否读取完毕
+
+```
+**3.类作用及对外接口总结**     
+这个类主要是编码解码一些字符串，还有一些整数，小数，编码成对应的字符串数据，然后解码为相应数据，目的是方便在业务上以二进制的数据存储，是一个通用的二进制协议流，一般在内部服务端与客户端可以相互使用通信。     
+
+-----------------------------------------------------------------------
+
+## EventLoop.h和EventLoop.cpp   
+整个网络库的核心，是一个事件循环类，主要的认为就是在一个循环中，不断查看是否有相应的事件发生，有的话就调用相应的事件处理函数。一个事件循环对应一个线程，从前面我们知道一个EventLoop对象中一定有一个poller对象，还有一个定时器TimerQueue对象      
+**1.类声明分析**   
+![eventloop](../Pictures/mudou_eventloop1.png)     
+从其中我们不难看出，里面确实有两个指针，一个是指向Poller,一个指向的是TimerQueue,还有一个pendingFunctors_，这是一个函数指针数组，里面存放着外部想要在该线程也就是该EventLoop中运行的函数。从这里我们也就知道EventLoop主循环应该就是做网络事件poller产生的，定时器事件，还有外部加入的事件，这三类事件是在整个EventLoop的主要任务。还有一个唤醒fd和channel，这个主要是唤醒整个EventLoop。
+**2.重要类函数实现分析**     
+```
+EventLoop::EventLoop()
+    : looping_(false),
+    quit_(false),
+    eventHandling_(false),
+    callingPendingFunctors_(false),
+    threadId_(std::this_thread::get_id()),
+    timerQueue_(new TimerQueue(this)),
+    iteration_(0L),
+currentActiveChannel_(NULL)     #构造函数会初始化变量包括new出poller,TimerQueue,还会创建一个wakeupfd，和对应的channel加入自己这个EventLoop,同时会设置可读回调函数，其实唤醒fd就是往这个fd写入一个数据。还有一个线程局部变量，保存每个EventLoop对象指针，确保一个线程只有一个EventLoop唯一对应      
+EventLoop::~EventLoop()   #析构函数会将唤醒channel移除poller中    
+void EventLoop::loop()    #真个EventLoop循环最重要的函数，一直重复着做上述三类事件    
+void EventLoop::doPendingFunctors()   #被loop函数调用做加入到该loop中的函数处理，因为可能是别的线程加入的事件，为保证vector线程安全，采用了mutex锁和swap先交换vecotr内容，后续函数处理花时间在交由该线程处理，不影响主线程继续往vector中加入要处理的函数。     
+void EventLoop::runInLoop(const Functor& cb)  #外部线程可以通过该函数将要该EventLoop处理的函数加入该线程中，如果本身在该线程中则会立即执行，否则就加入到vector中    
+TimerId EventLoop::runAt(const Timestamp& time, const TimerCallback& cb)#类似这样的函数就是加入到定时器中处理    
+bool EventLoop::updateChannel(Channel* channel) #更新channel内部调用poller的updateChannel()函数    
+bool EventLoop::wakeup()     #唤醒EventLoop只是往对应fd写入一个uint64_t数
+
+```  
+外部线程加入函数到本EventLoop处理的细节，如果不是在本线程或者正在执行pendingFunctors那么需要唤醒一下EventLoop一遍在loop函数中下一次循环中能够马上执行这个函数    
+![eventloop](../Pictures/mudou_eventloop2.png)  
+**3.类作用及对外接口总结**      
+整个EventLoop包含了所要处理的3大类事件，一个是网络IO事件，还有一个是定时器事件，提供了添加定时器的接口，还有一个是pendingFunctors中的事件，这个主要是来自外部线程需要本线程做的事，后续EventLoopThread类就是将线程和这个EventLoop对象包装，我们知道EventLoop管理着Poller和TimerQueue对象的生存周期，后续EventLoopThread则管理着EventLoop生命周期      
+
+## EventLoopThread.h和EventLoopThread.cpp    
+事件线程，就是将某个线程与某个EventLoop对象绑定起来方便一起处理，我们后面可以看到EventLoop是在线程绑定函数中创建的一个栈变量，并不是new出来的这点需要注意    
+**1.类声明分析**   
+![eventloopthread](../Pictures/mudou_eventloopthread1.png)     
+可以看到有一个线程指针变量和一个EventLoop*指针，然后就是配套使用的锁和条件变量   
+**2.重要类函数实现分析**     
+```
+EventLoopThread::EventLoopThread(const ThreadInitCallback& cb,
+				const std::string& name/* = ""*/)
+				: loop_(NULL),
+				exiting_(false),
+				callback_(cb) #构造函数并没有新建一个线程   
+EventLoop* EventLoopThread::startLoop() #最中要的一个函数，一旦调用该函数则会新建一个线程并绑定线程函数threadFunc()    
+void EventLoopThread::threadFunc()   #线程绑定函数，在新线程里面立即执行会创建一个栈变量对象EventLoop，如下图，然后会初始化好loop_成员变量，唤醒主线程，然后在该线程中loop()函数一直循环，调用startLoop()函数返回所对应的EventLoop指针，表明线程开始工作    
+
+```   
+![eventloopthread](../Pictures/mudou_eventloopthread.png)    
+**3.类作用及对外接口总结**      
+该类是一个线程一个EventLoop的体现，我们可以看到但构造了EventLoopThread对象并没有发生什么事，但当调用了startLoop()函数就生成对应的线程和EventLoop对象，开始工作。所以最重要的接口是startLoop()函数，我们知道EventLoopThread管理着EventLoop的生命周期，下面的线程池对象则管理着EventLoopThread对象的生命周期。      
+
+## EventLoopThreadPool.h和EventLoopThreadPool.cpp    
+线程池管理类，可以创建想要的数量的EventLoopThread对象，也就是想要几个工作线程   
+**1.类声明分析**   
+![EventLoopThreadPool](../Pictures/mudou_EventLoopThreadPool1.png)   
+很自然的能够想到成员变量一定有一个对应的EventLoopThread对象的指针的vector和对应的EventLoop指针的vector。next_是采用轮询的方式取出EventLoop供外部使用，baseLoop_则是对应着主线程的，也就是我们后面讲的acceptor,listener所在的线程   
+**2.重要类函数实现分析**     
+```
+EventLoopThreadPool::EventLoopThreadPool()
+    : baseLoop_(NULL),
+    started_(false),
+    numThreads_(0),
+    next_(0)    #构造函数并没有干什么     
+void EventLoopThreadPool::init(EventLoop* baseLoop, int numThreads)#初始化函数绑定主线程和所需要创建的线程数    
+void EventLoopThreadPool::start(const ThreadInitCallback& cb) #最重要的函数，依次在主线程中创建一定数量的EventLoopThread对象。并开始每个线程的工作    
+EventLoop* EventLoopThreadPool::getNextLoop()  #轮询机制的时候使用，从线程池中依次取出一个线程     
+EventLoop* EventLoopThreadPool::getLoopForHash(size_t hashCode) #根据hash值得到某个EventLoop，这样可以确保某项工作多次被同一个线程处理    
+```
+**3.类作用及对外接口总结**     
+线程池类是对EventLoopThread对象的封装，可以创建多个线程对象，该类是供TcpServer使用的，可以继续阅读下文，最重要的接口函数就是start()函数，当然必须先初始化给的主线程，和需要新建线程数量才能调用start()函数。     
+
+-----------------------------------------------------------------------
 
 
 

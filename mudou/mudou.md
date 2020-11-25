@@ -546,10 +546,119 @@ EventLoop* EventLoopThreadPool::getLoopForHash(size_t hashCode) #根据hash值�
 **3.类作用及对外接口总结**     
 线程池类是对EventLoopThread对象的封装，可以创建多个线程对象，该类是供TcpServer使用的，可以继续阅读下文，最重要的接口函数就是start()函数，当然必须先初始化给的主线程，和需要新建线程数量才能调用start()函数。     
 
------------------------------------------------------------------------
+-----------------------------------------------------------------------   
 
+## Acceptor.h和Acceptor.cpp    
+Acceptor,TcpConnection,还有TcpServer是服务端重要的三个组件，Acceptor主要是监听连接的，TcpConnection主要是建立连接，然后搭配上EventLoopThreadPool一起组成了一个TcpServer。最后对外的一个大接口就是TcpServer，主要是给服务端提供one thread one loop模型网络服务的。上层业务根据需要利用TcpServer对象处理业务逻辑，可以在TcpServer设定相应的业务回调函数，处理对应的业务逻辑，所以这句是整个Mudou网络库设计的核心。      
+**1.类声明分析**    
+![acceptor](../Pictures/mudou_acceptor1.png)     
+acceptor其实是一个特殊的channel，这个channel主要负责处理新连接的到来     
+loop_表示该Acceptor在哪个loop中循环，一般是在主线程loop中      
+newConnectionCallback_是一个回调函数，当有新的连接来的时候调用   
+idleFd_是一个描述符，为了处理过多连接，启动的未处理的描述符，对这种描述符，采取关闭的措施    
+**2.重要类函数实现分析**      
+```
+Acceptor::Acceptor(EventLoop* loop, const InetAddress& listenAddr, bool reuseport)
+    : loop_(loop),
+    acceptSocket_(sockets::createNonblockingOrDie()),
+    acceptChannel_(loop, acceptSocket_.fd()),
+    listenning_(false)   #构造函数，会创建一个非阻塞Socket和一个channel,同时会将该Socket绑定到某个监听地址     
+                         #同时会设置该channel可读回调函数Acceptor::handleRead，当::listen()有连接到来时会调用该函数    
+void Acceptor::handleRead()  #内部会调用acceptSocket_.accept(&peerAddr)，其实就是accept()函数，同时如果设置了新连接到来函数就会调用这个函数，其实这个函数是TcpServer中的newConnection()函数      
+void Acceptor::listen()  #Acceptor真正开始工作是在调用这个函数之后，会将绑定本地地址的描述符转化为监听描述符，内部会调用::listen()函数 
 
+```
+**3.类作用及对外接口总结**     
+从这里可以看到当我们需要使用Acceptor时，需要指明在哪个Loop,一般为主线程Loop,然后绑定监听的地址，当该描述符上有可读事件，也就是新连接到来，对应channel，会通过函数handleRead()处理，    
+内部会调用accept()得到一个已连接描述符，和对端地址，然后利用这两个参数，进一步调用newConnection()函数，TcpServer中会建立一个TcpConnection。加入EventLoopThreadPool中某个线程中。   
+所以对外只要调用listen(),然后调用void setNewConnectionCallback(const NewConnectionCallback& cb)设置好新连接到来的函数就行了。   
 
+## TcpConnection.h和TcpConnection.cpp     
+每一个Acceptor接收的新连接都会被回调函数生成一个个TcpConnection对象，TcpConnection对象表示了一个已经建立的连接         
+**1.类声明分析**    
+![TcpConnection](../Pictures/mudou_tcpconnection.png) 
+mudou的TcpConnection主要处理数据的收发，和整个的连接的断开和连接，收发数据是单独处理的，收数据保存在inputBuffer,发数据保存在outputBuffer。      
+handleWrtie(),handleRead(),handleClose(),handleError()，四个函数分别对应channel中对应的四个回调函数，如果poller模型中，该TcpConnection绑定的fd触发了相应的事件，那么对应channel就会调用这四个函数       
+handleWrite()里面当写完毕会调用对应的WwriteCompleteCallback_函数，当发的数据超过highWaterMark_，会调用对应的highWaterMarkCallback_;          
+handleRead()里面当读取完毕数据后，只是读到inputBuffer中，要通过messageCallback_去处理收到的数据      
+
+**2.重要类函数实现分析**      
+```
+TcpConnection::TcpConnection(EventLoop* loop, const string& nameArg, int sockfd, const InetAddress& localAddr, const InetAddress& peerAddr)
+    : loop_(loop),
+    name_(nameArg),
+    state_(kConnecting),
+    socket_(new Socket(sockfd)),
+    channel_(new Channel(loop, sockfd)),
+    localAddr_(localAddr),
+    peerAddr_(peerAddr),
+    highWaterMark_(64 * 1024 * 1024)    #构造函数四种连接状态，kConnecting,表示有这个对象，并没有真正准备好收发数据，KConnected已经准备好收发数据，KDisConnecting,正在断开连接，底层套接字只是关闭了读写功能::shutdown()，KDisConnected是调用handleClose()才会实现的，底层channel的disableAll()所以通道无效。      
+void TcpConnection::send(const void* data, int len) #各种send()函数底层都是调用sendInLoop(),如果是在工作线程中，则会直接发数据，否则会通过runInLoop()的形式加入到对应的EventLoop中的pendingFunctions的vector中      
+sendInLoop()   #如果数据一开始不是outputBuffer中出去，直接调用::write()写数据，可以提供一个不通过将对应的channel置为enableWrite状态,因为在服务端，当要发送数据我们一般直接发送     
+               #当数据没有发送完，会加入到outputBuffer中去，然后再将对应的channel置为enableWrite状态，下一次唤醒这个channel的可写事件，将outputBuffer中的数据发出去。    
+               #这样处理能尽可能快且高效的将数据发送出去      
+void TcpConnection::shutdown #各种shutdown函数最终都会到对应的EventLoop中去执行关闭socket的读写功能，然后状态置为kDisConnecting,只是业务上的关闭，逻辑并没有完成关闭      
+void TcpConnection::forceClose() #这个函数内部调用handleClose()函数将状置为KDisConnected     
+void TcpConnection::connectEstablished() #这个函数调用了才表明连接真正建立可以收发数据，状态为kConnected,同时会将对应channel，真正的和该TcpConnection对象绑定，此时才是真正的可以收发数据的连接状态。同时会调用connectCallback_回调表明真正建立连接。
+                                         #这里的connectCallback_,其实对应着TcpServer中的OnConnection()函数    
+void TcpConnection::handleRead(Timestamp receiveTime) #读数据到inputBuffer，同时调用messageCallback_处理数据      
+void TcpConnection::handleWrite() #从上面我们知道当发数据时我们并不是一开始就往outputBuffer中放数据，而是先尝试着直接::write()发，然后当没发送完，
+                                  #将数据再放入outputBuffer中，然后让该channel变为enableWrite在下一次loop中就可以触发这个函数了。完成outputBuffer数据的发送    
+void TcpConnection::handleClose() #真正的关闭连接，对应的channel在poller模型中，但永远不会被激活     
+void TcpConnection::connectDestroyed() #真正从对应的poller中移除
+
+```
+**3.类作用及对外接口总结**    
+TcpConnection类是给TcpServer使用的一个重要的类，没创建一个对象都表明有一个连接，对外的接口主要就是connectEstablished()，当TcpServer调用该函数时表明一个可以收发数据的连接建立，connectDestroyed()，被调用表明从对应的poller中移除同时可以设置各种回调函数，包括connectCallback_,messageCallback_,writeComplteCallback等。    
+
+## TcpServer.h和TcpServer.cpp    
+这个类就是最后服务端的boss类，也是最上层的类，我们可以想象该类肯定保存着一个线程池，还有一个Acceptor，还有管理着各种TcpConnection。整个的服务端的逻辑都在这里，当然这只是底层逻辑，并不包括业务数据逻辑的真正实现。同样的给上层业务提供了回调=函数的接口   
+**1.类声明分析**    
+![TcpServer](../Pictures/mudou_TcpServer1.png)     
+loop_指的是主线程loop，name_表示服务名，acceptor_,eventLoopThreadPool_为两个重要组成，负责接收连接，和实际服务分布线程。connections_是对应的连接和TcpConnection的map映射。     
+**2.重要类函数实现分析**   
+```
+TcpServer::TcpServer(EventLoop* loop,
+    const InetAddress& listenAddr,
+    const std::string& nameArg,
+    Option option)
+    : loop_(loop),
+    hostport_(listenAddr.toIpPort()),
+    name_(nameArg),
+    acceptor_(new Acceptor(loop, listenAddr, option == kReusePort)),
+    //threadPool_(new EventLoopThreadPool(loop, name_)),
+    connectionCallback_(defaultConnectionCallback),
+    messageCallback_(defaultMessageCallback),
+    started_(0),
+    nextConnId_(1)
+{
+    acceptor_->setNewConnectionCallback(std::bind(&TcpServer::newConnection, this, std::placeholders::_1, std::placeholders::_2));
+}   #构造函数，需要指定主Loop,还有服务地址，服务名，是否重用port四个参数，同时会new一个Acceptor对象，同时会设置acceptor的新连接到来的回调函数。     
+void TcpServer::start(int workerThreadCount/* = 4*/)  #TcpServer最重要的函数，开始服务，其中会新建线程池对象，同时会启动线程池开始工作，并且会将
+                                                      #Acceptor的listen()函数放入到主线程loop中的执行，一旦主线程开始loop，那么就会开启监听最后正常服务     
+void TcpServer::stop()    #停止服务，将每个TcpConnection对象调用connectDestroyed()函数，然后智能指针释放TcpConnection对象，最后停止主线程   
+void TcpServer::newConnection(int sockfd, const InetAddress& peerAddr)   #供Acceptor使用，当Acceptor接收新连接，会为这个连接创建一个TcpConnection对象，
+                                                                         #采用轮询的方式加入某个EventLoop中，每个连接的名字为"服务名:主机端口#连接号"，
+                                                                         #设置connectCallback_,messageCallback,writeCompleteCallback_,closeCallback,
+                                                                         #最后会将TcpConnection::connectEstablished()加入该EventLoop工作线程中执行   
+
+```   
+**3.类作用及对外接口总结**  
+TcpServer对外的接口就是start()函数，然后就是设置回调函数接口，这几个回调函数应该是上层业务所提供的，例如messageCallback_,就是说当建立了连接，这边每个      
+TcpConnection当有数据可读的时候就会去调用messageCallback_去解析数据，对应不同的数据，例如普通的聊天消息，心跳包等，则会做对应的处理。     
+
+现在我们看一下如果我们生成一个TcpServer对象，那么当执行start()函数之后会发生什么。      
+1.新建一个线程池对象，并且初始化 好，并调用EventLoopThreadPool::start()开始执行工作线程，现在没有一个连接     
+2.start中会继续向主线程中注册一个Acceptor::listen()函数，当主线程调用loop()函数时会执行到这个函数，然后Acceptor开始工作。    
+3.当Acceptor开始工作，接收到一个新连接时会调用TcpServer::newConnection()函数，该函数会新建一个TcpConnection对象，加入某个EventLoop,并将该对象初始化好，各种回调函数设置好，    
+并且向对应的EventLoop中，注册一个函数TcpConnection::connectEstablished()并执行,该函数会将该TcpConnection对象变为KConnected状态，并且把该TcpConnection对应的channel置为    enableRead状态，可以在poller模型中，接收数据。并且执行connectionCallback_,至此该连接整个建立完毕   
+
+> 最后看一张网上经典图    
+>![TcpServer](../Pictures/mudou_TcpServer2.png)    
+
+最上面的是TcpServer做的事，最右边的是EventLoopThreadPool做的事，左边边就是主线程所干的事。至此整个TcpServer服务端的底层逻辑全部讲完，下面还会有一小部分讲TcpClient的建立。           
+
+-------------------------------------------------------------------------------------
 
 
 

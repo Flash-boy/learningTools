@@ -611,7 +611,7 @@ void TcpConnection::connectDestroyed() #真正从对应的poller中移除
 **3.类作用及对外接口总结**    
 TcpConnection类是给TcpServer使用的一个重要的类，没创建一个对象都表明有一个连接，对外的接口主要就是connectEstablished()，当TcpServer调用该函数时表明一个可以收发数据的连接建立，connectDestroyed()，被调用表明从对应的poller中移除同时可以设置各种回调函数，包括connectCallback_,messageCallback_,writeComplteCallback等。    
 
-## TcpServer.h和TcpServer.cpp    
+## TcpServer.h和TcpServer.cpp      
 这个类就是最后服务端的boss类，也是最上层的类，我们可以想象该类肯定保存着一个线程池，还有一个Acceptor，还有管理着各种TcpConnection。整个的服务端的逻辑都在这里，当然这只是底层逻辑，并不包括业务数据逻辑的真正实现。同样的给上层业务提供了回调=函数的接口   
 **1.类声明分析**    
 ![TcpServer](../Pictures/mudou_TcpServer1.png)     
@@ -660,5 +660,66 @@ TcpConnection当有数据可读的时候就会去调用messageCallback_去解析
 
 -------------------------------------------------------------------------------------
 
+Connector TcpConnection TcpClient三个组件构成了网络库的客户端      
+## Connector.h和Connector.cpp         
+**1.类声明分析**    
+![Connector](../Pictures/mudou_Connector1.png)      
+Connector类似于Acceptor也是去建立连接，但是由于客户端没有大量连接，所以所有工作只在主loop中执行，没有线程池    
+**2.重要类函数实现分析**     
+```
+Connector::Connector(EventLoop* loop, const InetAddress& serverAddr)
+    : loop_(loop),
+    serverAddr_(serverAddr),
+    connect_(false),
+    state_(kDisconnected),
+    retryDelayMs_(kInitRetryDelayMs) #构造函数开始状态是kDisconnected,并没有连接只是有一个对象     
+void Connector::start()     #最重要的函数Connector开始工作内部向主loop注册一个函数startInLoop()     
+void Connector::startInLoop()  #当主loop调用loop函数时，刚函数执行会调用connect()函数     
+void Connector::connect()   #connect函数会创建一个非阻塞的描述符，然后调用::connect()函数去建立连接，当连接成功时也就是三次握手成功会调用connecting()     
+void Connector::connecting(int sockfd) #当调用该函数说明已经跟服务器连接上了，此时状态为connecting,此时只是逻辑连上了，但并没有设置什么连接，例如TcpConnection,      
+                                       #此时new一个新连接，绑定这个sockfd,然后设置channel为可写，当主loop中可写响应    
+void Connector::handleWrite() #该函数继续处理连接，这里会把该channel重置拿出fd，因为这时候要建立真正的连接，一开始只是为了作为Connector。充单一个桥梁，完成TcpConnection建立   
+                              #然后会设立状态为kConnected,并调用newConnectionCallback_，这个函数会是TcpClient中的newConnection,会创建一个TcpConnection对象，此时才真正的连接        
+void Connector::retry(int sockfd) #会关闭这个sockfd，设置状态为kDisconnected      
+
+```
+**3.类作用及对外接口总结**      
+Connector只是一个连接服务端的生产类，每一个与服务端连接的客户端连接都会经过Connector建立一个TcpConnection对象，这里同一个sockfd和channel，被用作了两次       
+第一次作为Connector,设置可写，以便在下一次loop循环中，调用handleWrite()函数，该函数会去建立TcpConnection     
+第二次就是作为真正的TcpConnection对象，用于跟服务端数据交流      
+
+## TcpClient.h和TcpClient.cpp          
+从前面我们知道现在重点是看TcpClient::newConnection()函数干了什么           
+**1.类声明分析**      
+![TcpClient](../Pictures/mudou_TcpClient1.png)      
+**2.重要类函数实现分析**     
+```
+TcpClient::TcpClient(EventLoop* loop,
+    const InetAddress& serverAddr,
+    const std::string& nameArg)
+    : loop_(loop),
+    connector_(new Connector(loop, serverAddr)),
+    name_(nameArg),
+    connectionCallback_(defaultConnectionCallback),
+    messageCallback_(defaultMessageCallback),
+    retry_(false),
+    connect_(true),
+    nextConnId_(1)   #构造函数会创建一个Connector对象用于连接，会设定其newConnectionCallback,为newConnection()函数      
+void TcpClient::connect()  #最重要的函数每一次connect()函数的调用会创建一个客户端到服务端的连接，内部调用connector_->start(),     
+void TcpClient::newConnection(int sockfd)  #上面调用的connect()会导致该函数调用，该函数会建立一个TcpConnection对象用于真正与服务端数据传输，并且把connection_设置为该TcpConnection对象      
+void TcpClient::removeConnection(const TcpConnectionPtr& conn)  #这是移除连接的函数，一旦该函数被调用说明要移除前面的连接，connection_总是保存最新一个TcpConnection对象。   
+                                                                #若是移除最新的对象则connection_会被重置，并且如果是有重连机制，而且处理连接状态，会进行再次连接。    
+void TcpClient::disconnect() #整断开最新一个连接      
+void TcpClient::stop()       #内部调用connector->stop(),connector停止工作，不能连接服务端          
+```
+**3.类作用及对外接口总结**     
+整个TcpClient主要是建立与服务端多个连接，相对服务器比较简单但基本逻辑还是涵盖了整个客户端的知识，设计的很巧妙，抽象出来一个Connector对象帮助建立连接     
+
+----------------------------------------------------------------------------
+
+## 总结    
+至此整个mudou网络库的服务端客户端源码大致梳理完毕，这个主要是服务端，只是mudou网络库的github源码的重要组成部分，还有许多细节没有提到，但是整个网络端，one thread，one loop的模型还是体现出来，整个框架还是大体一致，这个mudou网络库是我从[Flamingo](https://github.com/balloonwj/flamingo)项目中发现的，我只是截取了该项目，利用的mudou网络库实践部分来分析。如果还想看上层业务数据的处理可以去[Flamingo](https://github.com/balloonwj/flamingo)中阅读相关代码。      
+
+ 
 
 

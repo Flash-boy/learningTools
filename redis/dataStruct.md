@@ -117,8 +117,118 @@ redis中的sds结构包括两部分一个是struct sdshdr,也就是sds header的
   整个sds字符串的设计并不难，利用了一个头部的结构就实现了动态字符串，不仅可以动态调整字符串，还采用了预分配内存和惰性释放内存的策略，使得对字符串的各种操作相对于传统的C风格字符串在效率上面有一定的提高，同时sds字符串是兼容C风格字符串。考虑到数据库中有许许多多的地方用到字符串，所以sds结构的设计在一定程度上提高了数据库的效率。      
 
 ### 3.adlist.h和adlist.c   
+adlist是双端链表的结构，也就是说链表既可以往前也可以往后遍历。由于redis每个数据基本都是由堆分配，所以双端链表里提供了三个函数指针，复制某个节点，释放某个节点匹配某个节点。adlist也是基本数据结构也不是很难      
+![adlist](../Pictures/redis_adlist2.png)     
+整个list由一个list头和多个listNode节点构成，list中head指向链表第一个节点，tai指向链表最后一个节点，dup,free,match分别是3个函数指针处理listNode,len表示list的长度，上图中为3，listNode中next指向下一节点，prev指向上一节点，value指针指向真正存放的节点数据。    
 
+- 设计思想    
+  adlist通用双端链表的设计和普通链表的设计的不同是可以向前和向后变量其他的也不是很复杂    
 
+- 源码分析
+  **adlist.h头文件**    
+  ![adlist](../Pictures/redis_adlist1.png)    
+  ![adlist](../Pictures/redis_adlist3.png)     
+  adlist一些宏定义的函数也十分的简单明了     
+  **adlist.c源文件**    
+  ```
+  list *listCreate(void) #创建一个空list，所以数据都为Null     
+  void listEmpty(list *list) #清空所有的listNode节点，如果有free函数，则会清空value所指的数据    
+  void listRelease(list *list) #清空所以list，包括头部和所有节点    
+  list *listAddNodeHead(list *list, void *value) #头插法插入一个节点    
+  list *listAddNodeTail(list *list, void *value) #尾插法插入一个节点    
+  list *listInsertNode(list *list, listNode *old_node, void *value, int after) #插入某个节点old_node的后面或者前面    
+  void listDelNode(list *list, listNode *node) #删除某个借点，有free，释放对应的value    
+  listIter *listGetIterator(list *list, int direction) #返回一个list迭代器direction为遍历的方向    
+  void listReleaseIterator(listIter *iter) #释放某个迭代器    
+  void listRewind(list *list, listIter *li) #重置某个迭代器从头部开始   
+  void listRewindTail(list *list, listIter *li) #重置某个迭代器从尾部开始    
+  listNode *listNext(listIter *iter) #返回迭代器的next所指向的值，同时更新迭代器的值    
+  list *listDup(list *orig) #完全复制一个list    
+  listNode *listSearchKey(list *list, void *key) #通过某个key比较节点值，返回符合条件的节点    
+  listNode *listIndex(list *list, long index) #返回某个索引对应的节点0为头结点，-1为最后一个节点   
+  void listRotate(list *list) #将list最后一个节点移动头节点，轮转    
+  void listJoin(list *l, list *o) #将o中的节点加入到l的尾部    
+  ```
+
+- 总结   
+  adlist也就是双端通用节点，也比较简单，注意到节点中值是用value指向的，list中有3个函数指针，dup,是复制listNode中的值时候用的，free是释放listNode中的值所用的，match是listNode是匹配比较list中的值所用的。     
+
+### 4.dict.h和dict.c    
+Redis的字典底层是通过哈希表实现的，哈希表解决冲突的方式是地址链法。每个哈希表节点有一个next指针，多个哈希表节点通过next 指针构成一个单向链表。因为 dictEntry 节点组成的链表没有指向链表表尾的指针，所以为了速度考虑，总是将新节点添加到链表的表头位置（复杂度为O(1)）,排在其他已有节点前面。随着操作的不断执行，哈希表保存的键值对会逐渐的增多或减少，为了让哈希表的负载因子维持在一个合理的阈值之内，当哈希表的键值对的数量太多或太少时，对哈希表进行相应的扩展或收缩。   
+
+- 设计思想  
+  redis的字典结构设计是为整个redis的核心内容至于，key,value的键值对如何保存在内存中，哈希表如何rehash而不影响效率，如传统的都是一次hash，但某个哈希表有大量数据的时候一次hash会造成巨大的时间，redis采用了一个很聪明的做法，渐进式rehash。这是整个dict的关键，保证了在大数据情况下能保证rehash的效率    
+
+- 源码分析    
+  **dict.h头文件**   
+  ![dict](../Pictures/redis_dict2.png)    
+  dictEntry,dictht,dict，dictType是整个dict的重要组成部分，dictTpye定义了很多字段所需要的函数的指针。dictEntry表示一个键值对，dictht表示一个哈希表，dict则表示一个字典    
+  ![dict](../Pictures/redis_dict1.png)    
+  看dict结构中，type表示该dict所需要的一些函数，privdata表示该dict的一些私有数据，ht则指向两种dicthb，rehashidx表示rehash时的索引，-1表示并没有在rehash,iterators表示当前正在有几个该dict的迭代器在使用    
+  dictht结构值，table则是一个数组每一个都是一个dictEntry指针，size，表示这个hashtable数组的长度也就是我们所理解的桶的数量，sizemask永远是size-1,用于得到对应dictEntry在数组中的索引，used表示当前hashtable中有几个dictEntry元素。    
+  dictEntry结构则表示了一个key,value键值对对象，有key，value可以是数或者指针，还有一个next指针，key的hash值同一个的通过链表连起来。      
+
+  ```
+  typedef void (dictScanFunction)(void *privdata, const dictEntry *de) #typedef定义了一个scan键值对函数    
+  typedef void (dictScanBucketFunction)(void *privdata, dictEntry **bucketref) #typedef定义了一个scan桶的函数    
+  ```   
+  一些常见的宏定义    
+  ![dict](../Pictures/redis_dict3.png)     
+
+  **dict.c源文件**  
+  ```
+  static void _dictReset(dictht *ht) #重置哈希表参数为0      
+  dict *dictCreate(dictType *type,void *privDataPtr) #给定dictType和privDataPtr创建一个dict     
+  int _dictInit(dict *d, dictType *type,void *privDataPtr) #初始化一个dict,该函数被上面的调用    
+  int dictResize(dict *d) #resize这个哈希表去最小的能包含当前元素的大小    
+  int dictExpand(dict *d, unsigned long size) #扩展或者创建一个哈希表       
+  static unsigned long _dictNextPower(unsigned long size) #返回大于等于size的最小的2次方，最小返回4    
+  int dictRehash(dict *d, int n) #渐进式rehash，这里rehash步数为n,每一步就是找到一个不为空的桶，把他们rehash到第二个表中   
+  int dictRehashMilliseconds(dict *d, int ms) #在ms时间内rehash，一次rehash100个bucket   
+  static void _dictRehashStep(dict *d) #一次rehash一个桶   
+  int dictAdd(dict *d, void *key, void *val) #dict加入一个键值对    
+  dictEntry *dictAddRaw(dict *d, void *key, dictEntry **existing) #dict中加入一个dictEntry如果key已经存在，则existing返回对应的dictEntry    
+  int dictReplace(dict *d, void *key, void *val) #dict代替某个键值对，如果key不存在则add一个新的键值对，如果key存在，则替换对应key的value值    
+  dictEntry *dictAddOrFind(dict *d, void *key) #某个key，若是存在则返回对应的dictEntry,若是不存在则向dict中增加一个dictEntry并返回对应的dictEntry    
+  static dictEntry *dictGenericDelete(dict *d, const void *key, int nofree) #删除某个dictEntry,nofree为true不释放对应dictEntry的key,value和dictEntry本身，为false则释放dictEntry和所对应的key,value    
+  int dictDelete(dict *ht, const void *key) #删除对应的dictEntry    
+  dictEntry *dictUnlink(dict *ht, const void *key) #只是将对应的dictEntry不连接到哈希表中，并没有删除它    
+  void dictFreeUnlinkedEntry(dict *d, dictEntry *he) #删除未连接到哈希表中孤立的dictEntry    
+  int _dictClear(dict *d, dictht *ht, void(callback)(void *)) #清空某个dictht   
+  void dictRelease(dict *d) #清空整个dict    
+  dictEntry *dictFind(dict *d, const void *key) #查找某个key对应的dictEntry    
+  void *dictFetchValue(dict *d, const void *key) #提取某个key对应的value值   
+  long long dictFingerprint(dict *d) #计算某个dict的指纹，也就是唯一标识，如果dict改动了那么所对应的指纹也就变了    
+  static int _dictExpandIfNeeded(dict *d) #扩展dict如果需要   
+  static long _dictKeyIndex(dict *d, const void *key, uint64_t hash, dictEntry **existing) #返回key所对应的索引，如果key已经存在那么返回-1    
+  dictIterator *dictGetIterator(dict *d) #创建对应的dict的迭代器。只能用于dictNext()       
+  dictIterator *dictGetSafeIterator(dict *d) #创建安全迭代器    
+  dictEntry *dictNext(dictIterator *iter) #得到下一个dictEntry   
+  void dictReleaseIterator(dictIterator *iter) #释放迭代器   
+  dictEntry *dictGetRandomKey(dict *d) #返回一个随机的key对应的dictEntry    
+  unsigned int dictGetSomeKeys(dict *d, dictEntry **des, unsigned int count)  #得到一些随机的dictEntry有可能会有重复的dictEntry   
+  static unsigned long rev(unsigned long v) #反转位值   
+  unsigned long dictScan(dict *d,
+                       unsigned long v,
+                       dictScanFunction *fn,
+                       dictScanBucketFunction* bucketfn,
+                       void *privdata)  #由于是渐进式rehash，这个函数保证能够遍历所以元素，虽然有少部分元素被重复遍历      
+
+  dictEntry **dictFindEntryRefByPtrAndHash(dict *d, const void *oldptr, uint64_t hash) #通过hash值和对应的key找到对应的dictEntry   
+  ```    
+  rehash操作    
+  ![dict](../Pictures/redis_dict4.png)      
+
+- 总结   
+  整个dict的关键是渐进式rehash,为了避免键值对过多的 rehash（涉及到庞大的计算量） 对服务器性能造成影响，服务器不是一次将ht[0] 上的所有键值对 rehash 到 ht[1]，而是分多次、渐进式的将 ht[0] 里所有的键值对进行迁移。    
+  渐进式hash 的步骤：     
+  1.为ht[1]分配空间，让字典同时持有 ht[0] ht[1]    
+  2.在字典中维持一个索引计数器变量 rehashidx，并将其设置为0，标识 rehash 开始    
+  3.在 rehash 期间，每次对字典的添加、删除、查找或更新等，程序除了执行指定的操作外，还会将ht[0] 哈希表在 rehashidx 索引上的所有键值对 rehash 到 ht[1] 上，当rehash 完成后，程序将 rehashidx 值加一。     
+  4.最终，ht[0]全部 rehash 到 ht[1] 上，这时程序将 rehashidx 值设置为 -1，标识 rehash 完成      
+  渐进式rehash 将rehash 的工作均摊到每个添加、删除、查找和更新中，从而避免集中rehash带来的问题。
+
+### 5.
 
 
 

@@ -10,6 +10,9 @@
   2.简单动态字符串(simple dynamic string)sds.h和sds.c   
   3.双端通用链表(A generic doubly linked list)adlist.h和adlist.c     
   4.哈希表字典(Hash Tables)dict.h和dict.c    
+  5.跳跃表(zskiplist)server.h中的zskiplist结构和t_zset.c中的zsl开头函数    
+  6.基数估算算法hyperloglog.c   
+  
 
 ### 如何利用该文档     
 该文档只是帮助你理解redis源码，最好是一般看源码一边结合该文档，按照上述的文档布局的先后顺序去阅读相关代码，相信能够很快的帮助你大致掌握整个redis源码的实现。另外我所阅读的源码是redis-4.0.11,可以去[官网](https://redis.io/download)下载，也可以在终端通过以下方式获得           

@@ -228,7 +228,115 @@ Redis的字典底层是通过哈希表实现的，哈希表解决冲突的方式
   4.最终，ht[0]全部 rehash 到 ht[1] 上，这时程序将 rehashidx 值设置为 -1，标识 rehash 完成      
   渐进式rehash 将rehash 的工作均摊到每个添加、删除、查找和更新中，从而避免集中rehash带来的问题。
 
-### 5.
+### 5.zskiplist   
+zskiplist跳跃表结构是一种链表的扩展，为了加快访问效率所产生的一种数据结构    
+
+- 设计思想   
+  Redis使用跳跃表作为有序集合键的底层实现之一,如果一个有序集合包含的元素数量比较多,又或者有序集合中元素的成员是比较长的字符串时, Redis就会使用跳跃表来作为有序集合健的底层实现。从上面我们可以知道，跳跃表在链表的基础上增加了多级索引以提升查找的效率，但其是一个空间换时间的方案，必然会带来一个问题——索引是占内存的。原始链表中存储的有可能是很大的对象，而索引结点只需要存储关键值值和几个指针，并不需要存储对象，因此当节点本身比较大或者元素数量比较多的时候，其优势必然会被放大，而缺点则可以忽略。    
+- 源码分析  
+  **server.h头文件中的zskiplist结构**   
+  ![zskiplist](../Pictures/redis_zskiplist1.png)    
+  ![zskiplist](../Pictures/redis_zskiplist2.png)   
+  header:指向跳跃表的表头节点，通过这个指针程序定位表头节点的时间复杂度就为O(1)   
+  tail:指向跳跃表的表尾节点,通过这个指针程序定位表尾节点的时间复杂度就为O(1)    
+  level:记录目前跳跃表内,层数最大的那个节点的层数(表头节点的层数不计算在内)，通过这个属性可以再O(1)的时间复杂度内获取层高最好的节点的层数。   
+  length:记录跳跃表的长度,也即是,跳跃表目前包含节点的数量(表头节点不计算在内)，通过这个属性，程序可以再O(1)的时间复杂度内返回跳跃表的长度    
+  层(level):    
+    节点中用1、2、L3等字样标记节点的各个层,L1代表第一层,L代表第二层,以此类推。      
+    每个层都带有两个属性:前进指针和跨度。前进指针用于访问位于表尾方向的其他节点,而跨度则记录了前进指针所指向节点和当前节点的距离(跨度越大、距离越远)。在上图中,连线上带有数字的箭头就代表前进指针,而那个数字就是跨度。当程序从表头向表尾进行遍历时,访问会沿着层的前进指针进行。      
+    每次创建一个新跳跃表节点的时候,程序都根据幂次定律(powerlaw,越大的数出现的概率越小)随机生成一个介于1和32之间的值作为level数组的大小,这个大小就是层的“高度”。      
+  后退(backward)指针：    
+    节点中用BW字样标记节点的后退指针,它指向位于当前节点的前一个节点。后退指针在程序从表尾向表头遍历时使用。与前进指针所不同的是每个节点只有一个后退指针，因此每次只能后退一个节点。     
+  分值(score):    
+    各个节点中的1.0、2.0和3.0是节点所保存的分值。在跳跃表中,节点按各自所保存的分值从小到大排列。    
+  成员对象(oj):    
+    各个节点中的o1、o2和o3是节点所保存的成员对象。在同一个跳跃表中,各个节点保存的成员对象必须是唯一的,但是多个节点保存的分值却可以是相同的:分值相同的节点将按照成员对象在字典序中的大小来进行排序,成员对象较小的节点会排在前面(靠近表头的方向),而成员对象较大的节点则会排在后面(靠近表尾的方向)。     
+
+  ![zskiplist](../Pictures/redis_zskiplist3.png)     
+
+  **t_zset.c源文件中以zsl开头的函数**    
+  ```
+  zskiplistNode *zslCreateNode(int level, double score, sds ele) #创建一个skiplistNode一共有多少级由外部的参数level决定，同时该节点包含了score和ele    
+  zskiplist *zslCreate(void) #创建一个跳跃表，包含一个头节点有32level,这个头节点相当于一个哨兵节点         
+  void zslFreeNode(zskiplistNode *node) #释放某个skiplistNode，会先释放元素ele，然后释放节点本身    
+  void zslFree(zskiplist *zsl) #释放整个节点的空间包括头结点，最后释放整个zsl   
+  int zslRandomLevel(void) #返回位于1到最高的level之间包括两者的某一level,越大概率越低   
+  zskiplistNode *zslInsert(zskiplist *zsl, double score, sds ele) #插入某个节点  
+  void zslDeleteNode(zskiplist *zsl, zskiplistNode *x, zskiplistNode **update) #删除某个节点    
+  int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node) #上面函数被这个函数真正调用删除某个分数对应的节点    
+  ```   
+  插入某个节点，假设score是2,level是6
+  ![zskiplist](../Pictures/redis_zskiplist4.png)     
+  插入该节点时，x为该节点，从图中可以看到从左到右原来的节点依次是，header,1,2,3。则update其实就是排在x左边每一level最近的一个节点,update[4]也就是level5层所以最大的小于该节点score，也就是header,update[3]就对应了第1个节点，update[2]对应第2个节点，update[1]对应第2个节点，update[0]对应第2个节点。rank[4]=0;rank[3]=1,rank[2]=2,rank[1]=2,rank[0]=2,     
+  ![zskiplist](../Pictures/redis_zskiplist5.png)     
+  从上面可以看到跳跃表是一个有序的从小到大排序的集合，从高level向低level查找，可以加快查找速度     
+
+- 总结    
+  redis的跳跃表的实现异常精妙，其本质是一个有序链表。结合了概率学，利用内存换时间，使得链表查找达到了o(logn)的速度。媲美红黑树。不过使用的空间应该要多于红黑树。但是其实现比红黑树简单很多，不存在红黑树纷繁复杂的左旋，右旋的操作。    
+
+###  6.hyperloglog.c    
+hyperloglog是一个算法用于估计一组数据不重复的次数，作用是能够提供不精确的去重计数，试想一下一个网站每天有上百万乃至上亿次数的点击，如何计算有多少用户访问过，hyperloglog就是这样一个算法能够提供一个估计去重值。     
+
+- 设计思想    
+  hyperloglog算法就是利用了概率的思想去估算出现的次数，HyperLogLog算法时一种非常巧妙的近似统计大量去重元素数量的算法，它内部维护了16384个桶来记录各自桶的元素数量，当一个元素过来，它会散列到其中一个桶。当元素到来时，通过 hash 算法将这个元素分派到其中的一个小集合存储，同样的元素总是会散列到同样的小集合。这样总的计数就是所有小集合大小的总和。使用这种方式精确计数除了可以增加元素外，还可以减少元素。一个HyperLogLog实际占用的空间大约是 13684 * 6bit / 8 = 12k 字节。但是在计数比较小的时候，大多数桶的计数值都是零。如果 12k 字节里面太多的字节都是零，那么这个空间是可以适当节约一下的。Redis 在计数值比较小的情况下采用了稀疏存储，稀疏存储的空间占用远远小于 12k 字节。相对于稀疏存储的就是密集存储，密集存储会恒定占用 12k 字节。   
+
+- 源码分析   
+  **hyperloglog.c源文件**    
+  不管是密集型结构还是稀疏性结构都有一个hyperloglog的header如下所示：    
+  ![hyperloglog](../Pictures/redis_hyperloglog1.png)    
+  魔幻字符“HYLL”，表示一个hyperloglog的标识，encoding则表示这个结构是稀疏性还是密集型结构。后3个字节保留使用，之后的8个字节，card[8],则是出于一个考虑，如果在一个hyperloglog中加入了一个数据，但该数据并没有影响组合估算的基数，那么我们就不需要去重新计算基数，这样省了许多时间，在数据很庞大的时候，大概率我们是不需要去重新计算的，最高位如果为0表示数据是有效的，基数没有被更新，为1则需要去重新计算基数。   
+
+  - 密集型结构   
+    registers也称为桶，密集型结构就是2的14次方，也即是16384个连续的6bit表示，16384个桶，占内存为12KB，因为用桶是为了计算每个桶所估算的数据，假设只有一个桶的话，如果出现了一个形如0x000000000000....1这样那么估算的基数就很大，如果有多个桶的话一个桶6位，最多63个数据，这样的话可以更进一步的减少估算误差，使估算稳定性更高。     
+
+  - 稀疏性结构   
+    稀疏性结构的 出现是因为这么多桶很大概率会出现好多是数据为0的桶，所以采用了如下所示的表示方法：    
+    ZERO形式的编码形如00xxxxxx,一个字节表示的由后6位生成的数字加1，表示连续多少个桶数据为0   
+    XZERO形式的编码形如01xxxxxx yyyyyyyy,两个字节，后面14位计算，表示多少个桶连续数据为0   
+    VAL形式的编码形如1vvvvvxx,一个字节，其中5位用来表示桶的数据的值value，xx两位用来表示有多少个连续的桶值为value,最大表示1-4个连续的值1-32。     
+  
+  稀疏性结构在一定条件下会转化为密集型结构       
+
+  一些低级别函数的宏定义     
+  ![hyperloglog](../Pictures/redis_hyperloglog2.png)    
+  ```
+  #左边是低位右边是高位    
+  #define HLL_DENSE_GET_REGISTER(target,p,regnum)  #储存在密集型结构中regnum位置的桶的值到target中，假设第一个字节为0x1000001 第二个字节为0x10100101        
+                                                   #那么regnum 0 对应的就是第一个字节的低6位也就是1，regnum 1对应的就是第一个字节的高两位作为低位，第二个字节的低四位作为高位组成的6位数就是010110也就是22        
+  #define HLL_DENSE_SET_REGISTER(p,regnum,val) #设置在密集型结构中regnum位置的桶的值   
+  ```     
+  下面就是一些函数说明        
+  ```
+  uint64_t MurmurHash64A (const void * key, int len, unsigned int seed) #返回一个key的hash值用的是MurmurHash2,64位版本    
+  int hllPatLen(unsigned char *ele, size_t elesize, long *regp)  #返回一个给定元素的在桶的索引和模式pattern"00001"从低位到高为第一个1出现的位数包括第一个1。     
+  int hllDenseSet(uint8_t *registers, long index, uint8_t count) #给index索引桶设置值为count,如果返回1表示该桶最大值改变了，则缓冲去估算的基数要重新计算，返回0否则不需要     
+  int hllDenseAdd(uint8_t *registers, unsigned char *ele, size_t elesize) #上面几个函数的调用先计算hash值然后计算桶index和count,最后调用hllDenseSet()函数，返回1表明估计基数值修改    
+  double hllDenseSum(uint8_t *registers, double *PE, int *ezp) #计算桶计算的调和平均值   
+
+  int hllSparseToDense(robj *o) #转化这个稀疏性结构为密集型结构，都是字符串sds流    
+  int hllSparseSet(robj *o, long index, uint8_t count) #向hyperloglog稀疏性中加如这个值，可能转化为密集型，如果当稀疏性表示的值不能覆盖count,或者稀疏性结构字节大小大于某个临界值hll_sparse_max_bytes    
+  int hllSparseAdd(robj *o, unsigned char *ele, size_t elesize) #添加一个ele元素，先计算索引和count,然后调用hllSparseSet()函数添加进稀疏性结构    
+  double hllSparseSum(uint8_t *sparse, int sparselen, double *PE, int *ezp, int *invalid) #计算稀疏性结构的调和平均值      
+
+  double hllRawSum(uint8_t *registers, double *PE, int *ezp) #原生数据求和     
+  uint64_t hllCount(struct hllhdr *hdr, int *invalid) #依据hllhdr结构中的encoding为密集型，还是稀疏型还是原生型计算count数     
+  int hllAdd(robj *o, unsigned char *ele, size_t elesize) #加入某个元素到hyperloglog算法中    
+  int hllMerge(uint8_t *max, robj *hll) #合并每个桶中的最大值，将每个桶最大值写入对应max中   
+  
+  ```
+  ![hyperloglog](../Pictures/redis_hyperloglog3.png)   
+  从这里就可以判断一个给定的hash值应该属于哪个桶值为多少，这里属于索引为10的桶count值为4   
+
+- 总结   
+  hyperloglog以字符串流的形式存储数据，分为稀疏性和密集型，密集型固定需要12KB的内存空间保存16384的内存结构，不论是稀疏性还是密集型都能够起到估算基数的作用，稀疏型是采用连续多少个0或者连续几个值为xxx,这样的字节编码起到压缩数据的作用，更大大的减小了空间。总之虽然hyperloglog看起来很高深，其实在看完源码之后也就明白了，是如何做到12KB估算统计几百万乃至上亿的数据 。     
+   
+
+
+
+
+
+
+
 
 
 

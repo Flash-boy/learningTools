@@ -122,7 +122,104 @@ intset顾名思义，是由整数组成的集合。实际上，intset是一个�
   整个ziplist设计的很巧妙，包括整个的ziplist的布局，由头部和entry和尾部3部分组成，
   每个entry又由previous_entry_length和encoding和content这3个属性构成，整个ziplist是由特殊编码规则编写的连续内存存放不同数据类型和长度的包含entry的数组。    
 
-  
+
+### 3.quicklist.h和quicklist.c       
+之前我们讲过双端列表和压缩列表，他们是Redis List(列表)对象的底层实现方式。但是考虑到链表的附加空间相对太高，prev和next指针就要占去16个字节(64bit 系统的指针是8个字节)，另外每个节点的内存都是单独分配，会加剧内存的碎片化，影响内存管理效率。因此Redis3.2版本开始对列表数据结构进行了改造，使用 quicklist 代替了 ziplist 和 linkedlist。quicklist是由ziplist组成的双向链表，链表中的每一个节点都以压缩列表ziplist的结构保存着数据，而ziplist有多个entry节点，保存着数据。相当与一个quicklist节点保存的是一片数据，而不再是一个数据。     
+
+- 设计思想   
+  quicklist宏观上是一个双向链表，因此，它具有一个双向链表的有点，进行插入或删除操作时非常方便，虽然复杂度为O(n)，但是不需要内存的复制，提高了效率，而且访问两端元素复杂度为O(1)。quicklist微观上是一片片entry节点，每一片entry节点内存连续且顺序存储。利用压缩列表的连续内存性质，在存储同样的数量的元素时，相对于双端列表内存分片率会大大下降，但压缩列表的插入删除速度又相对于双端列表慢，所以这里需要在节约内存和速度之间选择一个平衡。     
+
+- 源码解析    
+  **quicklist.h头文件**    
+  ![quicklist](../Pictures/redis_quicklist1.png)    
+  ![quicklist](../Pictures/redis_quicklist2.png)   
+  ```
+  prev:前一个节点指针。
+  next:下一个节点指针。
+  zl:数据指针。如果当前节点的数据没有压缩，那么它指向一个ziplist结构；否则，它指向一个quicklistLZF结构。
+  sz: 表示zl指向的ziplist的总大小（包括zlbytes, zltail, zllen, zlend和各个数据项）。需要注意的是：如果ziplist被压缩了，那么这个sz的值仍然是压缩前的ziplist大小。
+  count: 表示ziplist里面包含的数据项个数。这个字段只有16bit。稍后我们会一起计算一下这16bit是否够用。
+  encoding: 表示ziplist是否压缩了（以及用了哪个压缩算法）。目前只有两种取值：2表示被压缩了（而且用的是LZF压缩算法），1表示没有压缩。
+  container: 是一个预留字段。本来设计是用来表明一个quicklist节点下面是直接存数据，还是使用ziplist存数据，或者用其它的结构来存数据（用作一个数据容器，所以叫container）。但是，在目前的实现中，这个值是一个固定的值2，表示使用ziplist作为数据容器。
+  recompress: 当我们使用类似lindex这样的命令查看了某一项本来压缩的数据时，需要把数据暂时解压，这时就设置recompress=1做一个标记，等有机会再把数据重新压缩。
+  attempted_compress: 这个值只对Redis的自动化测试程序有用。我们不用管它。
+  extra: 其它扩展字段。目前Redis的实现里也没用上。
+  ```    
+  ```
+  quicklistLZF结构表示一个被压缩过的ziplist。其中：   
+  sz: 表示压缩后的ziplist大小。
+  compressed: 是个柔性数组（flexible array member），存放压缩后的ziplist字节数组。
+  ```  
+  ```
+  head: 指向头节点（左侧第一个节点）的指针。
+  tail: 指向尾节点（右侧第一个节点）的指针。
+  count: 所有ziplist数据项的个数总和。
+  len: quicklist节点的个数。
+  fill: 16bit，ziplist大小设置，存放list-max-ziplist-size参数的值。
+  compress: 16bit，节点压缩深度设置，存放list-compress-depth参数的值。
+
+  fill成员对应的配置：list-max-ziplist-size  -2 
+  当数字为负数，表示以下含义：
+  -1 每个quicklistNode节点的ziplist字节大小不能超过4kb。（建议）
+  -2 每个quicklistNode节点的ziplist字节大小不能超过8kb。（默认配置）
+  -3 每个quicklistNode节点的ziplist字节大小不能超过16kb。（一般不建议）
+  -4 每个quicklistNode节点的ziplist字节大小不能超过32kb。（不建议）
+  -5 每个quicklistNode节点的ziplist字节大小不能超过64kb。（正常工作量不建议）
+  当数字为正数，表示：ziplist结构所最多包含的entry个数。最大值为 215215。
+
+  compress成员对应的配置：list-compress-depth  0
+  后面的数字有以下含义：
+  0 表示不压缩。（默认）
+  1 表示quicklist列表的两端各有1个节点不压缩，中间的节点压缩。
+  2 表示quicklist列表的两端各有2个节点不压缩，中间的节点压缩。
+  3 表示quicklist列表的两端各有3个节点不压缩，中间的节点压缩。
+  以此类推，最大为 216216。
+  ```    
+  ![quicklist](../Pictures/redis_quicklist3.png)   
+  quicklist也定义了自己的迭代器struct quicklistIter和保存每个节点的信息的结构struct quciklistEntry      
+  ```
+  quicklist:指向所属的quicklist的指针
+  node:指向所属的quicklistNode节点的指针
+  zi:指向当前ziplist结构的指针
+  value:指向当前ziplist结构的字符串vlaue成员
+  longval:指向当前ziplist结构的整数value成员
+  sz:保存当前ziplist结构的字节数大小
+  offset:保存相对ziplist的偏移量
+
+  quicklist:指向所属的quicklist的指针
+  current:指向当前迭代的quicklist节点的指针
+  zi:指向当前quicklist节点中迭代的ziplist
+  offset:当前ziplist结构中的偏移量      /* offset in  ziplist */
+  direction:迭代方向
+  ``` 
+
+  **quicklist.c源文件**    
+  quicklist.c源码的操作基本都是根据以上结构去调整位置  
+  ```
+  int quicklistPushHead(quicklist *quicklist, void *value, size_t sz) #向quicklist中头部插入一个entry，如果头部本身的quicklistNode可以插入则加入这个ziplist中，否则字节创建一个quicklistNode加入其中    
+  int quicklistPushTail(quicklist *quicklist, void *value, size_t sz) #向尾部插入一个entry，同理如果可以插入最后一个节点那么就加入其中的ziplist中，不行就在尾部新建一个quicklistNode加入其中   
+  void quicklistAppendZiplist(quicklist *quicklist, unsigned char *zl) #根据已有的ziplist向quicklist尾部加入一个节点   
+  quicklist *quicklistAppendValuesFromZiplist(quicklist *quicklist,unsigned char *zl) #将已有的ziplist中的每一个entry提取出来加入到quicklist的尾部    
+  REDIS_STATIC int quicklistDelIndex(quicklist *quicklist, quicklistNode *node,unsigned char **p) #删除quicklist节点上的某个p指向的entry    
+  void quicklistDelEntry(quicklistIter *iter, quicklistEntry *entry) #删除某个被entry表示的元素    
+  int quicklistReplaceAtIndex(quicklist *quicklist, long index, void *data,int sz)  #替代某个idx索引位置处的值为data    
+  void quicklistInsertBefore(quicklist *quicklist, quicklistEntry *entry,void *value, const size_t sz) #在某个entry之前插入    
+  void quicklistInsertAfter(quicklist *quicklist, quicklistEntry *entry,void *value, const size_t sz) #在某个entry之后插入    
+  int quicklistDelRange(quicklist *quicklist, const long start,const long count) #删除从start索引开始count个entry   
+  quicklistIter *quicklistGetIterator(const quicklist *quicklist, int direction) #获得一个quicklist的迭代器    
+  int quicklistNext(quicklistIter *iter, quicklistEntry *entry) #获得迭代器的下一个值   
+  quicklist *quicklistDup(quicklist *orig) #完全复制原来的quicklist   
+  int quicklistIndex(const quicklist *quicklist, const long long idx,quicklistEntry *entry) #获取索引为idx的entry   
+  void quicklistRotate(quicklist *quicklist) #移动尾部的元素到头部   
+  int quicklistPopCustom(quicklist *quicklist, int where, unsigned char **data,
+                       unsigned int *sz, long long *sval,
+                       void *(*saver)(unsigned char *data, unsigned int sz)) # 从quicklist的头节点或尾节点的ziplist中pop出一个entry，分该entry保存的是字符串还是整数。如果字符串的话，需要传入一个函数指针，这个函数叫_quicklistSaver()，真正的pop操作还是在这两个函数基础上在封装了一次，来操作拷贝字符串的操作。
+  int quicklistPop(quicklist *quicklist, int where, unsigned char **data,unsigned int *sz, long long *slong) #从最前面一个元素或者最后面一个元素弹出   
+  void quicklistPush(quicklist *quicklist, void *value, const size_t sz,int where) #在最前面一个entry或者最后面一个entry插入一个数据    
+  ```  
+
+- 总结   
+  quicklist是Redis3.2版本以后针对链表和压缩列表进行改造的一种数据结构，是zipList和linkedList的混合体，相对于链表它压缩了内存,进一步的提高了效率。看懂整个内存布局就明白它的设计思想和用途了。    
 
 
 

@@ -15,7 +15,8 @@
 
 - [memoryEncode.md](./memoryEncode.md) 主要是redis内存编码结构的实现，包括:     
   1.整数集合数据结构 intset.h和intset.c    
-  2.压缩列表数据结构 ziplist.h和ziplist.c   
+  2.压缩列表数据结构 ziplist.h和ziplist.c    
+  3.快速列表数据结构 quicklist.h和quicklist.c      
   
 
 ### 如何利用该文档     

@@ -11,7 +11,11 @@
   3.双端通用链表(A generic doubly linked list)adlist.h和adlist.c     
   4.哈希表字典(Hash Tables)dict.h和dict.c    
   5.跳跃表(zskiplist)server.h中的zskiplist结构和t_zset.c中的zsl开头函数    
-  6.基数估算算法hyperloglog.c   
+  6.基数估算算法hyperloglog.c 
+
+- [memoryEncode.md](./memoryEncode.md) 主要是redis内存编码结构的实现，包括:     
+  1.整数集合数据结构 intset.h和intset.c    
+  2.压缩列表数据结构 ziplist.h和ziplist.c   
   
 
 ### 如何利用该文档     

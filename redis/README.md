@@ -18,6 +18,11 @@
   2.压缩列表数据结构 ziplist.h和ziplist.c    
   3.快速列表数据结构 quicklist.h和quicklist.c      
   
+- [dataType.md](./dataType.md) 主要是redis对象的实现包括:    
+  1.string对象,list对象,set对象,hash对象,zset对象,object.c         
+      
+  
+  
 
 ### 如何利用该文档     
 该文档只是帮助你理解redis源码，最好是一般看源码一边结合该文档，按照上述的文档布局的先后顺序去阅读相关代码，相信能够很快的帮助你大致掌握整个redis源码的实现。另外我所阅读的源码是redis-4.0.11,可以去[官网](https://redis.io/download)下载，也可以在终端通过以下方式获得           

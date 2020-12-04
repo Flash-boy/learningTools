@@ -19,9 +19,11 @@
   3.快速列表数据结构 quicklist.h和quicklist.c      
   
 - [dataType.md](./dataType.md) 主要是redis对象的实现包括:    
-  1.string对象,list对象,set对象,hash对象,zset对象,object.c         
+  1.string对象,list对象,set对象,hash对象,zset对象,object.c    
+  2.字符串对象的命令实现 t_string.c  
+  3.列表对象的命令实现 t_list.c    
+
       
-  
   
 
 ### 如何利用该文档     

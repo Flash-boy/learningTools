@@ -50,6 +50,7 @@
   |OBJ_SET|OBJ_ENCODING_HT|使用字典实现的集合对象|  
   |OBJ_SET|OBJ_ENCODING_INTSET|使用整数集合实现的集合对象|
   |OBJ_HASH|OBJ_ENCODING_ZIPLIST|使用压缩列表实现的哈希对象|
+  |OBJ_HASH|OBJ_ENCODING_HT|使用字典实现的哈希对象|   
   |OBJ_ZSET|OBJ_ENCODING_SKIPLIST|使用跳跃表和字典两种结构实现的有序集合对象|
   |OBJ_ZSET|OBJ_ENCODING_ZIPLIST|使用压缩列表实现的有序集合对象|   
 
@@ -236,6 +237,170 @@
   |BRPOP|brpop key [key ...] timeout|若key对应的列表没有数据则在一定时间内等待数据然后执行rpop操作|    
   |BRPOPLPUSH|brpoplpush source destination timeout|若source对应的列表没有数据则在一定时间内等待数据，然后执行rpoplpush操作|    
   
+
+### 4.t_hash.c     
+哈希对象的实现在redis里面有两种一种是ziplist，里面的entry前一个是key，后一个是value，哈希对象元素比较超过一定数量或者哈希的对象的字符串长度超过一定值就会转化为顶层为dict的实现，所以redis里面哈希对象有两种实现一个是ziplist，一个是dict    
+
+- 设计思想    
+  redis里面的hash对象，就是某个key对应的对象是哈希对象，所以也被称为哈希键，其实一个数据库本身就是一个dict就是哈希对象，然后字典里面的某个key所对应的对象就可以是字符串对象，列表对象，我们这里介绍的哈希对象等    
+
+- 源码解析  
+  **t_hash.c源文件**    
+  ```
+  ##################################哈希对象 API####################################
+  void hashTypeTryConversion(robj *o, robj **argv, int start, int end)  #检查某个对象的长度是否需要转化哈希对象的底层实现由ziplist向dict     
+  int hashTypeGetFromZiplist(robj *o, sds field,unsigned char **vstr,unsigned int *vlen,long long *vll) #从ziplist实现的哈希对象中=获取某个key的值    
+  sds hashTypeGetFromHashTable(robj *o, sds field) #从dict实现的哈希对象中获取某个对象的值   
+  int hashTypeGetValue(robj *o, sds field, unsigned char **vstr, unsigned int *vlen, long long *vll) #上面两个函数的封装，从哈希对象获得某个字段的值    
+  robj *hashTypeGetValueObject(robj *o, sds field) #类似上面的获得哈希对象的某个字段的值，封装为对象返回    
+  size_t hashTypeGetValueLength(robj *o, sds field) #得到哈希对象某个字段值的长度    
+  int hashTypeExists(robj *o, sds field)  #判断哈希对象某个字段的值是否存在   
+  int hashTypeSet(robj *o, sds field, sds value, int flags) #哈希对象中设置某个key，value，如果存在就更新，flags是标明是否复制key，value，还是直接利用传进来的key,value    
+  int hashTypeDelete(robj *o, sds field)  #删除哈希对象的某个key,value    
+  unsigned long hashTypeLength(const robj *o) #返回哈希对象的元素个数，一个key，value是一个    
+  hashTypeIterator *hashTypeInitIterator(robj *subject) #初始化一个哈希对象的迭代器   
+  int hashTypeNext(hashTypeIterator *hi) #移动迭代器到下一个哈希对象的entry    
+  void hashTypeCurrentFromZiplist(hashTypeIterator *hi, int what,unsigned char **vstr,unsigned int *vlen,long long *vll) #得到ziplist实现哈希对象迭代器所对应的值，what指明是key还是value     
+  sds hashTypeCurrentFromHashTable(hashTypeIterator *hi, int what) #从dict实现的哈希对象迭代器所得到的值，what表示是key还是value     
+  void hashTypeCurrentObject(hashTypeIterator *hi, int what, unsigned char **vstr, unsigned int *vlen, long long *vll) #得到哈希对象迭代器所对应的值，what指明是key还是value的值    
+  sds hashTypeCurrentObjectNewSds(hashTypeIterator *hi, int what) #根据哈希对象迭代器的值返回一个新的sds对象    
+  robj *hashTypeLookupWriteOrCreate(client *c, robj *key) #从数据库中查找某个key对应的value是否为哈希对象，是则返回，不是则新建一个哈希对象   
+  ```   
+  其实哈希类型的实现默认一开始就是ziplist的底层实现，连续两个entry,前一个是key后一个是value，然后当元素多了，或者元素里面某个字符串长度超过一定的值就转化为dict实现的哈希类型对象     
+
+  ```
+  ################################### HASH 命令实现###################################
+  void hsetnxCommand(client *c) #HSETNX命令，向某个key所对应的哈希对象中插入field和value,如果哈希对象不存在则创建一个新的，如果field不存在则插入对应的field,value，存在则返回0    
+  void hsetCommand(client *c) #HSET命令，向某个key对应的哈希对象中插入一定数量的field和value，可以多个   
+  void hincrbyCommand(client *c) #HINCRBY命令，向某个key对应的对象的field字段对应的值加increment    
+  void hincrbyfloatCommand(client *c) #HINCRBYFLOAT命令，和上面一样只不过加的是浮点数    
+  void hgetCommand(client *c) #HGET命令，得到某个哈希对象field的值   
+  void hmgetCommand(client *c) #HMGET命令，得到某个哈希对象多个field字段的值    
+  void hdelCommand(client *c) #HDEL命令，删除某个哈希对象的多个field字段，返回删除的个数   
+  void hlenCommand(client *c) #HLEN命令，返回哈希对象的元素个数    
+  void hstrlenCommand(client *c) #返回哈希对象的某个字段对应的值长度   
+  void genericHgetallCommand(client *c, int flags) #为得到field,value所有值的通用函数   
+  void hkeysCommand(client *c) #HKEYS命令，得到某个哈希对象的所有field   
+  void hvalsCommand(client *c) #HVALS命令，得到某个哈希对象的所有field对应的value   
+  void hgetallCommand(client *c) #HGETALL命令，得到哈希对象的所有[field,value]键值对   
+  void hexistsCommand(client *c) #HEXISTS命令，判断哈希对象的field字段是否存在，1存在，0不存在   
+  void hscanCommand(client *c) #HSCAN命令，按模式扫描哈希对象    
+  ```
+
+- 总结   
+   |命令|使用方法|作用|
+  |:----|:----|:------|
+  |HSETNX|hsetnx key field value|向key对应的哈希对象中插入field，value键值对，如果key对应的哈希对象不存在则创建，如果field不存在才插入field，value,否则返回0|  
+  |HSET|hset key field value|向key对应的哈希对象插入多个field,value键值对，如果key对应的哈希对象不存在则创建，field可以存在，修改对应的值，返回插入元素个数|     
+  |HMSET| hmset key field value [field value ...]|和上面的hset一样的效果，只不过成功返回OK|      
+  |HINCRBY|hincrby key field increment|向key对应的哈希对象的field对应的value值加increment，如果key不存在则创建新的哈希对象如果field对应的值不存在则默认为0加increment|     
+  |HINCRBYFLOAT| hincrbyfloat key field increment|和HINCRBY一样只不过加的是浮点数|  
+  |HGET|hget key field|得到key对应的哈希对象field字段的值|   
+  |HMGET|hmget key field [field ...]|得到key对应的哈希对象的多个field字段的值|   
+  |HDEL|hdel key field [field ...]|删除key对应的哈希对象的多个field字段，字段存在才删除，返回实际删除个数|  
+  |HLEN|hlen key|返回key对应的哈希对象的元素个数|     
+  |HSTRLEN|hstrlen key field|返回key对应的哈希对象的field字段对应的值长度|   
+  |HKEYS|hkeys key|得到key对应的哈希对象的所有field|   
+  |HVALS|hvals key|得到key对应的哈希对象的所有field对应的值|     
+  |HGETALL|hgetall key|得到key对应的哈希对象的所有[field,value]|    
+  |HEXISTS|hexists key field|判断key对应的哈希对象的fiedl字段是否存在，1存在，0不存在|   
+  |HSCAN|hscan key cursor [MATCH pattern] [COUNT count]|扫描哈希对象获取对应pattern下count个[field,value]键值对，默认是count 10|   
+
+
+### 5.t_set.c    
+集合类型是保存不重复元素的集合，redis里面的set实现，是字典，当元素全部可以转化为整数表示的时候，采用的是intset整数集合的编码，当有元素不是整数，或者集合元素个数超过了set_max_intset_entries大小时会转化为底层编码采用dict，dict元素的entry的key保存集合元素，value是Null    
+
+- 设计思想    
+  redis的集合类型，集合对象是无序的t_set.c里面采用了两种编码方式，当元素全部为整数或者元素个数小于某一个值时采用intset编码，一旦条件被打破就转化为dict编码    
+
+- 源码分析    
+  **t_set.c源文件**    
+  ```
+  ##################################SET API########################################
+  robj *setTypeCreate(sds value) #根据值value是否为整数，返回一个set底层编码是采用inset还是dict    
+  int setTypeAdd(robj *subject, sds value) #往set里面加入一个值，如果需要底层编码可以由intset转化为dict   
+  void setTypeConvert(robj *setobj, int enc) #将set类型底层编码由intset转化为dict    
+  int setTypeRemove(robj *setobj, sds value) #往set里面删除某元素   
+  int setTypeIsMember(robj *subject, sds value) #判断某元素是不是set的成员    
+  setTypeIterator *setTypeInitIterator(robj *subject) #初始化一个set的迭代器，set类型的迭代器其实就是包装了dict迭代器和intset迭代器    
+  void setTypeReleaseIterator(setTypeIterator *si) #删除迭代器    
+  int setTypeNext(setTypeIterator *si, sds *sdsele, int64_t *llele) #返回迭代器的值，并移动迭代器    
+  sds setTypeNextObject(setTypeIterator *si) #将上面函数的返回迭代器的值包装成一个对象    
+  int setTypeRandomElement(robj *setobj, sds *sdsele, int64_t *llele) #返回set一个随机元素    
+  unsigned long setTypeSize(const robj *subject) #返回set元素总个数    
+  ```    
+  ```
+  #################################SET 命令#########################################
+  void saddCommand(client *c)  #往set里面加入元素，如果set不存在则创建第一个元素对应底层编码的set     
+  void sremCommand(client *c) #往set里面移除元素,移除存在的指定元素   
+  void smoveCommand(client *c #将一个set的某个元素移动到另一个set中    
+  void sismemberCommand(client *c) #判断某个成员是否属于某个set    
+  void scardCommand(client *c) #返回某个set中元素个数   
+  void spopWithCountCommand(client *c)  #这个命令并不是直接命令，删除一定数量的元素，采取两种策略，删除元素个数少时，直接pop随机元素，删除元素多时，就将不要删除的元素保存为新的set，然后返回原集合除去保留部分   
+  void spopCommand(client *c)  #SPOP命令，移除多个元素   
+  void srandmemberWithCountCommand(client *c) #返回set中随机的count个元素，同样如果count为负数，则只返回对应count个个数元素，如果为正数采取上面的两种策略，看返回元素个数多少，则要返回不一样的元素为count个   
+  void srandmemberCommand(client *c) #随机返回一个元素    
+  int qsortCompareSetsByRevCardinality(const void *s1, const void *s2) #将集合快速排序根据集合元素个数，下面的函数会使用   
+  void sinterGenericCommand(client *c, robj **setkeys,unsigned long setnum, robj *dstkey) #求集合数组的交集的函数，如果dstkey不为空，则把交集元素放入这个dstkey对应的集合中    
+  void sinterCommand(client *c) #求集合交集    
+  void sinterstoreCommand(client *c) #求集合交集并存储交集到某个key对应的集合中    
+  void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,robj *dstkey, int op) #求集合并集和不同元素集合的函数，其中并集合，就是简单的把每一个集合元素加入到一个新集合中，不同元素有两种算法    
+                                                                                            #算法1，遍历集合1中的元素，其他集合都没有则该元素是所求的元素之一      
+                                                                                            #算法2，将集合1中元素先全部加入到结果中，然后遍历其他集合元素，若是在结果集中，则从结果集合中移除该元素    
+  void sunionCommand(client *c) #求并集    
+  void sunionstoreCommand(client *c) #求并集并加入到一个新的集合中   
+  void sdiffCommand(client *c) #第一个求集合中不同于其他集合中的元素    
+  void sdiffstoreCommand(client *c） #求第一个集合中不同于其他集合的元素并加入到一个新的集合中    
+  void sscanCommand(client *c) #扫描集合函数和hscan命令一样  
+  ```  
+
+- 总结    
+   |命令|使用方法|作用|
+  |:----|:----|:------|
+  |SADD|sadd key member [member ...]|往key对应的set里面加入元素，如果set不存在，则依据第一个元素的类型创建底层编码实现的set，然后向该set加入不存在的元素，返回加入的有效个数|     
+  |SREM|srem key member [member ...]|往key对应的set里面移除元素，如果元素存在则移除，返回实际移除元素的个数|   
+  |SMOVE|smove source destination member|将src集合中的member移动到dst集合中，若集合dst不存在则创建|    
+  |SISMEMBER|sismember key member|判断key对应的set中是否有成员member|  
+  |SCARD|scard key|返回key对应set集合中元素个数|   
+  |SPOP|spop key [count]|随机删除key对应集合中count个可选元素|     
+  |SRANDMEMBER|srandmember key [count]|返回key对应set中随机元素，如果count为负数，则可能会有重复元素，若为正数则是不重复元素个数|    
+  |SINTER|sinter key [key ...]|求多个key对应的集合的交集|   
+  |SINTERSTORE|sinterstore destination key [key ...]|求多个key对应的集合的交集并存储到destination对应的集合中|    
+  |SUNION|sunion key [key ...]|求多个key对应的集合的并集|     
+  |SUNIONSTORE|sunionstore destination key [key ...]|求对个key对应的集合的并集并存到dst集合中|   
+  |SDIFF|sdiff key [key ...]|求第一个key对应的集合中不同于其他集合中的元素，集合1特有的元素|    
+  |SDIFFSTORE|sdiffstore destination key [key ...]|求第一个key对应的集合中特有的元素并存到集合dst中|    
+  |SSCAN|hscan key cursor [MATCH pattern] [COUNT count]|和HSACN命令一样扫描集合|   
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+     
+
+
+
+
+
+
+
+
 
      
 

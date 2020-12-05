@@ -22,6 +22,9 @@
   1.string对象,list对象,set对象,hash对象,zset对象,object.c    
   2.字符串对象的命令实现 t_string.c  
   3.列表对象的命令实现 t_list.c    
+  4.哈希对象的命令实现 t_hash.c   
+  5.集合对象的命令实现 t_set.c   
+   
 
       
   

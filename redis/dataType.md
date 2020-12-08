@@ -355,7 +355,7 @@
   ```  
 
 - 总结    
-   |命令|使用方法|作用|
+  |命令|使用方法|作用|
   |:----|:----|:------|
   |SADD|sadd key member [member ...]|往key对应的set里面加入元素，如果set不存在，则依据第一个元素的类型创建底层编码实现的set，然后向该set加入不存在的元素，返回加入的有效个数|     
   |SREM|srem key member [member ...]|往key对应的set里面移除元素，如果元素存在则移除，返回实际移除元素的个数|   
@@ -373,7 +373,181 @@
   |SSCAN|hscan key cursor [MATCH pattern] [COUNT count]|和HSACN命令一样扫描集合|   
 
 
+### 6.t_zset.c    
+有序集合的实现，有序集合是集合的升级版，我们知道集合一般是没有序的，但redis设计了一种数据类型有序集合，redis同样采用了两种编码，一种是ziplist压缩列表，另一种是skiplist+dict实现的。     
 
+- 设计思想    
+  有序集合其中一种是采用ziplist实现，采用的ziplist中每连续两个entry表示有序集合中一个元素，第一个entry记录了对应的有序集合元素，第二个则记录了该集合的score，用来排序。有序集合的元素默认采用的是按分数从前往后在ziplist中排序。另外一种底层实现是利用ditc的key存储对应的元素，key对应的value存储对应的score,然后外加一个skiplist来实现排序。     
+
+- 源码分析    
+  **t_zset.c源码分析**    
+  有序集合为了应对不同范围，实现了可以获得或者删除有序集合某一范围的元素，既然存在范围就存在比较，redis的zset，共有两种比较一种是对应元素的score，另一种是对应元素的值本身。同样带来一个问题就是开闭区间的问题，我们用什么表示一个区间。redis为了上面的两种比较设计了两种结构来表示区间。    
+  ![zset](../Pictures/redis_zset1.png)      
+  min,max表示区间的两端，minex和maxex表示是否包含对应的区间端点。     
+  ```
+  ############################################zskiplist API###################################
+  int zslDelete(zskiplist *zsl, double score, sds ele, zskiplistNode **node) #删除skiplist中的对应分数的对应元素     
+  int zslValueGteMin(double value, zrangespec *spec) #判断分数是否大于区间的min  
+  int zslValueLteMax(double value, zrangespec *spec) #判断分数是否小于区间的max，这两个一起组合使用判断是否在某一区间    
+  int zslIsInRange(zskiplist *zsl, zrangespec *range) #判断列表的分数是否在区间range范围内    
+  zskiplistNode *zslFirstInRange(zskiplist *zsl, zrangespec *range)  #找到skiplist中第一个分数在range范围内的节点    
+  zskiplistNode *zslLastInRange(zskiplist *zsl, zrangespec *range) #找到skiplist中最后一个分数在range范围内的节点   
+  unsigned long zslDeleteRangeByScore(zskiplist *zsl, zrangespec *range, dict *dict) #删除分数在range范围内的有序集合的元素，dict中的key和skiplist中的ptr是指向同一个对象     
+  unsigned long zslDeleteRangeByLex(zskiplist *zsl, zlexrangespec *range, dict *dict) #删除元素本身词典比较的范围内的有序集合的元素    
+  unsigned long zslDeleteRangeByRank(zskiplist *zsl, unsigned int start, unsigned int end, dict *dict) #按范围start,end表示删除第start个到第end个元素开始，第一个元素rank为1     
+  unsigned long zslGetRank(zskiplist *zsl, double score, sds ele) #返回某个key和分数对应的元素在skiplist里面的rank，也就是第几个    
+  zskiplistNode* zslGetElementByRank(zskiplist *zsl, unsigned long rank) #从skiplist中第几个元素返回该节点    
+  static int zslParseRange(robj *min, robj *max, zrangespec *spec) #从min，max对象解析范围存储到spec中，(1.5 (2.5 表示开区间的1.5 2.5 其他默认是闭区间    
+  int zslParseLexRangeItem(robj *item, sds *dest, int *ex)  # 解析词典比较的item对象，解析结果放入dest和ex中，dest表示比较的词典，ex表示是否开区间       
+                                                            # (foo   表示解析成开区间的foo用于比较 ，dest为foo,ex为1     
+                                                            # [foo   表示解析成闭区间的foo用于比较 
+                                                            # +      表示解析成最大的字符串
+                                                            # -      表示解析成最小的字符串     
+  int zslParseLexRange(robj *min, robj *max, zlexrangespec *spec) #将min,max表示的上面的item解析到对应的spec中    
+  int zslIsInLexRange(zskiplist *zsl, zlexrangespec *range)  #按词典排序的skipList是否在range范围内    
+  zskiplistNode *zslFirstInLexRange(zskiplist *zsl, zlexrangespec *range) #得到在词典范围内的skiplist的第一个节点    
+  zskiplistNode *zslLastInLexRange(zskiplist *zsl, zlexrangespec *range) #得到在词典范围内的skiplist的最后一个节点    
+  ```   
+  ```
+  ###############################################ziplist编码的API####################################
+  double zzlGetScore(unsigned char *sptr) #解析ziplist中某个entry，该entry表示的是有序集合元素的分数，返回分数      
+  sds ziplistGetObject(unsigned char *sptr) #解析ziplist中某个entry，该entry表示的是有序集合的元素，返回该元素，ziplist中实现的两个entry构成一对，构成有序集合中的一个元素    
+  int zzlCompareElements(unsigned char *eptr, unsigned char *cstr, unsigned int clen) #比较ziplist编码有序集合中的eptr所指向的元素与cstr指向的字符串    
+  unsigned int zzlLength(unsigned char *zl) #返回ziplist编码有序集合中元素个数    
+  void zzlNext(unsigned char *zl, unsigned char **eptr, unsigned char **sptr) #返回有序集合中下一个entry,eptr指向元素，sptr指向分数
+  void zzlPrev(unsigned char *zl, unsigned char **eptr, unsigned char **sptr) #返回有序集合中前一个entry    
+  int zzlIsInRange(unsigned char *zl, zrangespec *range) #判断ziplist编码的有序集合分数是否在某个范围range内    
+  unsigned char *zzlFirstInRange(unsigned char *zl, zrangespec *range) #找到第一个在range范围内分数的元素    
+  unsigned char *zzlLastInRange(unsigned char *zl, zrangespec *range) #找到最后一个在range范围内分数的元素    
+  int zzlLexValueGteMin(unsigned char *p, zlexrangespec *spec) #词典排序，p对应的是否比spec中最小范围内的词典大   
+  int zzlLexValueLteMax(unsigned char *p, zlexrangespec *spec) #词典排序，p对应的是否比spec中最大范围内的词典小   
+  int zzlIsInLexRange(unsigned char *zl, zlexrangespec *range) #有序集合按词典排序是否在指定的范围内    
+  unsigned char *zzlFirstInLexRange(unsigned char *zl, zlexrangespec *range) #有序集合按词典排序找到在范围range中第一个元素   
+  unsigned char *zzlLastInLexRange(unsigned char *zl, zlexrangespec *range) #有序集合中按词典排序找到在范围range中最后一个元素   
+  unsigned char *zzlFind(unsigned char *zl, sds ele, double *score) #找到有序集合中元素ele对应的分数   
+  unsigned char *zzlDelete(unsigned char *zl, unsigned char *eptr) #删除有序集合中的元素，其实是删除ziplist中元素和分数两个entry   
+  unsigned char *zzlInsertAt(unsigned char *zl, unsigned char *eptr, sds ele, double score) #在有序集合中某个元素后面插入一个新的元素   
+  unsigned char *zzlInsert(unsigned char *zl, sds ele, double score) #在有序集合插入某个元素，该元素分数是score，有序集合首先按分数排序，然后分数相同按词典排序   
+  unsigned char *zzlDeleteRangeByScore(unsigned char *zl, zrangespec *range, unsigned long *deleted) #删除有序集合在某一范围内的元素    
+  unsigned char *zzlDeleteRangeByLex(unsigned char *zl, zlexrangespec *range, unsigned long *deleted) #删除有序集合在某一词典范围内的元素   
+  unsigned char *zzlDeleteRangeByRank(unsigned char *zl, unsigned int start, unsigned int end, unsigned long *deleted) #删除有序集合中[start,end]指定的rank范围内的元素    
+  ```
+  
+  ```
+  ###############################################zset相关命令API###################################################
+  unsigned int zsetLength(const robj *zobj) #返回有序集合的元素个数   
+  void zsetConvert(robj *zobj, int encoding) #ziplist编码和skiplist编码的相互转化    
+  void zsetConvertToZiplistIfNeeded(robj *zobj, size_t maxelelen) #如果skiplist的元素小于一定个数并且每个元素的最大值小于等于maxelelen时转化为ziplist编码    
+  int zsetScore(robj *zobj, sds member, double *score) #返回有序集合的元素member对应的分数    
+  int zsetAdd(robj *zobj, double score, sds ele, int *flags, double *newscore) #给某个元素增加分数，flags表明对何种元素操作，newscore是新的分数  
+                                                                               # flags作为参数加入函数有以下几种含义   
+                                                                               # ZADD_INCR 增加当前元素的分数score，如果元素不存在则假设原先元素分数为0   
+                                                                               # ZADD_NX 执行ZADD_INCR操作当前仅当该元素不存在   
+                                                                               # ZADD_XX 执行ZADD_INCR操作当前仅当该元素存在 
+
+                                                                               # 同时当函数执行完毕会重置flags有以下几种含义   
+                                                                               # ZADD_NAN 结果分数不是一个数  
+                                                                               # ZADD_ADDED 原先元素不存在是一个新增加的元素   
+                                                                               # ZADD_UPDATED 该元素分数被成功更新   
+                                                                               # ZADD_NOP 由于NX和XX可能没有执行相应的操作    
+
+                                                                               # 返回1表示成功，0表示失败    
+  int zsetDel(robj *zobj, sds ele) #从有序集合删除元素   
+  long zsetRank(robj *zobj, sds ele, int reverse) #返回某个元素对应的rank，第一个元素是0,reverse表明是否最高分是第0个rank,默认最低分为rank 0    
+  ```    
+
+  ```
+  ###########################################ZSET命令实现API####################################################
+  void zaddGenericCommand(client *c, int flags) #ZADD各种命令参数的实现    
+  void zaddCommand(client *c) #ZADD增加新元素   
+  void zincrbyCommand(client *c) #增加已有元素分数    
+  void zremCommand(client *c) #删除元素    
+  void zremrangeGenericCommand(client *c, int rangetype) #三种删除操作byscore,byrank,bylex  
+  void zremrangebyrankCommand(client *c) #删除通过rank 
+  oid zremrangebyscoreCommand(client *c) #删除通过分数   
+  void zremrangebylexCommand(client *c) #删除通过lex   
+  ```   
+  ```
+  #########################################集合操作API################################################
+  /*struct zsetopsrc,struct zsetopval #将普通集合和有序集合包装成一个结构zsetopsrc,结构包装成结构zsetopsrc */
+  void zuiInitIterator(zsetopsrc *op) #初始化集合结构迭代器   
+  void zuiClearIterator(zsetopsrc *op) #清楚集合迭代器，重置   
+  int zuiLength(zsetopsrc *op) #返回集合中元素    
+  int zuiNext(zsetopsrc *op, zsetopval *val) #检查迭代器向的当前元素是否有效有效把值存到val中，并移动到下一个元素   
+  int zuiLongLongFromValue(zsetopval *val) #从val结构中获取longlong值   
+  sds zuiSdsFromValue(zsetopval *val) #从val结构中获取sds    
+  sds zuiNewSdsFromValue(zsetopval *val) #从val结构中获取sds的复制    
+  int zuiBufferFromValue(zsetopval *val) #从私有缓存中获取value   
+  int zuiFind(zsetopsrc *op, zsetopval *val, double *score) #从op指向的集合中找到val所指向的值并把score存储到其中   
+  int zuiCompareByCardinality(const void *s1, const void *s2) #比较两个集合元素多少    
+  inline static void zunionInterAggregate(double *target, double val, int aggregate) #根据需要设置target值，可能把val加到target,也可能target取target和val中大的或者小的   
+  void zunionInterGenericCommand(client *c, robj *dstkey, int op) #有序集合并集交集函数，有利用字典加速求结果     
+  void zunionstoreCommand(client *c) #有序集合并集操作   
+  void zinterstoreCommand(client *c) #有序集合交集操作   
+  void zrangeGenericCommand(client *c, int reverse) #zrange操作，返回相关索引范围的元素，默认按分数重低到高，reverse为真，则重高到低 
+  void zrangeCommand(client *c) #返回对应范围索引元素
+  oid zrevrangeCommand(client *c) #返回对应范围索引元素，重高到低  
+  void genericZrangebyscoreCommand(client *c, int reverse)   #按分数返回元素   
+  void zcountCommand(client *c) #返回分数在一定范围内的元素个数   
+  void zlexcountCommand(client *c) #判断是否有元素在词典范围内，开始会先看最后一个和第一个元素是否在范围内    
+  void genericZrangebylexCommand(client *c, int reverse) #返回在词典范围内的元素   
+  void zcardCommand(client *c) #返回元素的个数   
+  void zscoreCommand(client *c) #返回某个元素的分数   
+  void zrankGenericCommand #返回某个元素的rank值   
+  void zscanCommand(client *c) #扫描有序集合    
+  ```
+
+- 总结   
+  |命令|使用方法|作用|
+  |:----|:----|:------|
+  |ZADD| zadd key [NX|XX] [CH] [INCR] score member [score member ...]|增加新元素或者改变新元素的分数，或者增加已有元素分数|  
+  |ZINCRBY|zincrby key increment member|找到key对应有序集合元素member,增加已有元素的分数,若是不存在则新建该元素|    
+  |ZREM|zrem key member [member ...]|删除key对应的有序集合的元素member|    
+  |ZREMRANGEBYRANK|zremrangebyrank key start stop|删除key对应的有序集合中排序在索引[start stop]范围内的元素，支持负数|   
+  |ZREMRANGEBYSCORE|zremrangebyscore key min max|删除key对应的有序集合中分数在min,max对象构成的range内的元素，(1.5 (2.5表示开区间(1.5,2.5)|  
+  |ZREMRANGEBYLEX|zremrangebylex key min max|删除key对应的有序集合中词典大小在min,max对象构成的range内的元素，必须要用(,[开头，或者 +，-表示最大最小字符串，例如(a [f表示(a,f]直接的元素|    
+  |ZUNIONSTORE|zunionstore destination numkeys key [key ...] [WEIGHTS weight [weigth ...]] [AGGREGATE SUM\|MIN\|MAX]|求集合的并集，默认权重是1.0后面的参数是表示共同参数是求和还是取大小值，如果destination存在将被覆盖|   
+  |ZINTERSTORE|zinterstore destination numkeys key [key ...] [WEIGHTS weight [weigth ...]] [AGGREGATE SUM\|MIN\|MAX]|求集合的交集，默认权重是1.0后面的参数是表示共同参数是求和还是取大小值，如果destination存在将被覆盖|    
+  |ZRANGE|zrange key start stop [WITHSCORES]|获取有序集合中[start,stop]指向的元素，索引为0开始，WITHSCORES是否获取对应的分数|  
+  |ZREVRANGE |zrevrange key start stop [WITHSCORES]|获取有序集合中[start,stop]范围的元素，重高到低显示|      
+  |ZRANGEBYSCORE| zrangebyscore key min max [WITHSCORES] [LIMIT offset count]|返回key对应的有序列表在分数范围min，max之中偏离第一个满足的offset位置的count个元素|   
+  |ZREVRANGEBYSCORE|zrevrangebyscore key max min [WITHSCORES] [LIMIT offset count]|和上面一致不过是重最后一个满足的开始向前偏离|    
+  |ZCOUNT|zcount key min max|返回分数在一定范围内的元素个数|  
+  |ZRANGEBYLEX|zrangebylex key min max [LIMIT offset count]|返回key对应的有序列表在词典范围内，min,max中第一个满足的offset位置的count个元素|  
+  |ZRANGEBYLEX|zrangebylex key min max [LIMIT offset count]|返回key对应的有序列表在词典范围内，min,max中第一个满足的offset位置的count个元素|  
+  |ZREVRANGEBYLEX|zrevrangebylex key min max [LIMIT offset count]|和上面一致不过是最后一个满足偏离|   
+  |ZCARD|zcard key|返回key对应的有序集合元素个数|  
+  |ZSCORE|zscore key member|返回key对应的有序集合的元素member对应的分数|   
+  |ZRANK|zrank key member|返回key对应的有序集合的元素member的rank,处0开始|  
+  |ZREVRANK|zrevrank key member|返回key对应的有序集合的元素member的反向rank,最后一个元素为0往前|   
+  |ZSCAN| zscan key cursor [MATCH pattern] [COUNT count]|遍历key对应的有序集合|    
+  
+
+
+
+
+
+
+
+
+
+
+
+   
+
+
+
+
+
+
+
+
+
+
+
+
+
+  
 
 
 

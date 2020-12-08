@@ -522,6 +522,30 @@
   |ZREVRANK|zrevrank key member|返回key对应的有序集合的元素member的反向rank,最后一个元素为0往前|   
   |ZSCAN| zscan key cursor [MATCH pattern] [COUNT count]|遍历key对应的有序集合|    
   
+### 7.hyperloglog.c    
+hyperloglog键的实现就是基于前面讲过的hyperloglog数据结构，估算一个大的集合的元素不重复个数    
+
+- 设计思想 
+  hyperloglog采用的是概率的算法，HyperLogLog实际上不会存储每个元素的值，它使用的是概率算法，通过存储元素的hash值的第一个1的位置，来计算元素数量。   
+
+- 源码分析   
+  ```
+  robj *createHLLObject(void)  #创建一个HLL对象，底层是字符串编码实现，HLL结构采用的是稀疏结构一定条件会转化为密集型结构   
+  int isHLLObjectOrReply(client *c, robj *o)  #判断一个对象是不是HLL对象  
+  void pfaddCommand(client *c) #向某个HLL中加入元素   
+  void pfcountCommand(client *c) #计算基数   
+  void pfmergeCommand(client *c)  #把多个key对应的HLL结构合并   
+  ```
+
+- 总结   
+  |命令|使用方法|作用|
+  |:----|:----|:------|
+  |PFADD|pfadd key element [element ...]|往某个key对应的HLL结构中加入元素|  
+  |PFCOUNT|pfcount key [key ...]|计算多个key对应的集合的并集的基数| 
+  |PFMERGE|pfmerge destkey sourcekey [sourcekey ...]|把多个sourcekey对应的HLL结构合并到dsetkey对应的HLL结构中|  
+
+
+
 
 
 

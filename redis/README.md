@@ -29,6 +29,8 @@
 
 - [redisDB.md](./redisDB.md) 主要是redis数据库的实现包括:     
   1.操作redis数据库命令的实现 db.c     
+  2.redis数据库利用订阅发布实现通知功能 pubsub.c和notify.c  
+  
   
    
 

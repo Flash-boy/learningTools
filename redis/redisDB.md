@@ -159,7 +159,144 @@ redis的通知功能是基于订阅发布的所实现的，听起来好像一脸
   |PUBSUB|pubsub subcommand [argument [argument ...]]|主要是一些查看当前数据库的订阅channel,pattern的命令|   
   |PUBSUB CHANNELS|pubsub channels [pattern] |查看当前数据库的符合pattern模式的channel,pattern可以为空，则显示所有channel| 
   |PUBSUB NUMSUB|pubsub numsub [[channel1] [channel2] ...]|查看订阅某个channel的客户端数|   
-  |PUBSUB NUMPAT|pubsun numpat|查看服务器当前总的pattern数|   
+  |PUBSUB NUMPAT|pubsun numpat|查看服务器当前总的pattern数|     
+
+### 2.RDB持久化     
+因为Redis是内存数据库，它将自己的数据库状态储存在内存里面，所以如果不想办法将储存在内存中的数据库状态保存到磁盘里面，那么一旦服务器进程退出，服务器中的数据库状态也会消失不见，为了解决这个问题，Redis提供了RDB持久化功能，这个功能可以将Redis在内存中的数据库状态保存到磁盘里面，避免数据意外丢失，RDB持久化既可以手动执行，也可以根据服务器配置选项定期执行，该功能可以将某个时间点上的数据库状态保存到一个RDB文件。     
+
+- 设计思想    
+  RDB的实现是保存当前数据库存储的键值数据以特殊形式保存到二进制文件中，包括数据还有各种状态，然后在服务器下次启动时加载该文件恢复数据。       
+  有两个Redis命令可以用于生成RDB文件，一个是SAVE，另一个是BGSAVE      
+  SAVE：SAVE命令会阻塞Redis服务器进程，直到RDB文件创建完毕为止，在服务器进程阻塞期间，服务器不能处理任何命令请求        
+  BGSAVE：和SAVE命令直接阻塞服务器进程的做法不同，BGSAVE命令会派生出一个子进程，然后由子进程负责创建RDB文件，服务器进程（父进程）继续处理命令请求      
+  ![rdb](../Pictures/redis_rdb1.png)     
+  redis在执行save或者bgsave命令时的状态     
+  > **SAVE命令执行时服务器的状态**
+  > - 当SAVE命令执行时，Redis服务器会被阻塞，所以当SAVE命令正在执行时，客户端发送的所有命令请求都会被拒绝
+  > - 只有在服务器执行完SAVE命令、重新开始接受命令请求之后，客户端发送的命令才会 被处理
+
+
+  > **BGSAVE命令执行时服务器的状态**
+  > - 因为BGSAVE命令的保存工作是由子进程执行的，所以在子进程创建RDB文件的过程中，服务器仍然可以继续处理客户端的命令请求，但在BGSAVE命令执行期间，服务器处理SAVE、BGSAVE、BGREWRITEAOF三个命令的方式会和平时有所不同  
+  > - ①在BGSAVE命令执行期间，客户端发送的SAVE命令会被服务器拒绝，服务器禁止 SAVE命令和BGSAVE命令同时执行是为了避免父进程（服务器进程）和子进程同时执行两个 rdbSave调用，防止产生竞争条件
+  > - ②在BGSAVE命令执行期间，客户端发送的BGSAVE命令会被服务器拒绝，因为同 时执行两个BGSAVE命令也会产生竞争条件
+  > - **③BGREWRITEAOF和BGSAVE两个命令不能同时执行：**
+  > 1.如果BGSAVE命令正在执行，那么客户端发送的BGREWRITEAOF命令会被延迟到 BGSAVE命令执行完毕之后执行  
+  > 2.如果BGREWRITEAOF命令正在执行，那么客户端发送的BGSAVE命令会被服务器拒绝    
+  > - 因为BGREWRITEAOF和BGSAVE两个命令的实际工作都由子进程执行，所以这两个命令在操作方面并没有什么冲突的地方，不能同时执行它们只是一个性能方面的考虑,并发出两个子进程，并且这两个子进程都同时执行大量的磁盘写入操作，这怎么想都不会是一个好主意
+
+  RBD文件的载入是在服务器启动的时候完成的。RDB文件的载入工作是在服务器启动时自动执行的，所以Redis并没有专门用于载入RDB文件的命令，只要Redis服务器在启动时检测到RDB文件存在，它就会自动载入RDB文件服务器在载入RDB文件期间，会一直处于阻塞状态，直到载入工作完成为止。      
+
+  > AOF持久化对RDB持久化的影响：   
+  > - 如果服务器开启了AOF持久化功能，那么服务器会优先使用AOF文件来还原数据库状 态，那么就不会使用RDB文件了
+  > - 只有在AOF持久化功能处于关闭状态时，服务器才会使用RDB文件来还原数据库状态   
+
+
+- 源码分析    
+  这次我们直接从最上层的命令函数开始看起一个一个函数来解析，先看看一个RDB文件到底是怎样分布的     
+  ![rdb](../Pictures/redis_rdb2.png)          
+  ```
+  **************************save命令实现函数*************************
+  void saveCommand(client *c) {
+    if (server.rdb_child_pid != -1) {
+        addReplyError(c,"Background save already in progress");
+        return;
+    }
+    rdbSaveInfo rsi, *rsiptr;  
+    // 初始化rsi结构
+    rsiptr = rdbPopulateSaveInfo(&rsi);  
+    // 调用rdbsave()函数    
+    if (rdbSave(server.rdb_filename,rsiptr) == C_OK) {
+        addReply(c,shared.ok);
+    } else {
+        addReply(c,shared.err);
+    }
+  }
+  ```   
+  ```
+  ***************************rdbsave()函数*******************
+  int rdbSave(char *filename, rdbSaveInfo *rsi) {
+    char tmpfile[256];
+    char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
+    FILE *fp;
+    rio rdb;
+    int error = 0;
+    // 初始化一个临时文件    
+    snprintf(tmpfile,256,"temp-%d.rdb", (int) getpid());
+    fp = fopen(tmpfile,"w");
+    if (!fp) {
+        char *cwdp = getcwd(cwd,MAXPATHLEN);
+        serverLog(LL_WARNING,
+            "Failed opening the RDB file %s (in server root dir %s) "
+            "for saving: %s",
+            filename,
+            cwdp ? cwdp : "unknown",
+            strerror(errno));
+        return C_ERR;
+    }
+    //将该文件绑定到一个rio对象，用于写     
+    rioInitWithFile(&rdb,fp);  
+    //实际写数据到磁盘     
+    if (rdbSaveRio(&rdb,&error,RDB_SAVE_NONE,rsi) == C_ERR) {
+        errno = error;
+        goto werr;
+    }
+    //刷新到磁盘
+    /* Make sure data will not remain on the OS's output buffers */
+    if (fflush(fp) == EOF) goto werr;
+    if (fsync(fileno(fp)) == -1) goto werr;
+    if (fclose(fp) == EOF) goto werr;
+
+    /* Use RENAME to make sure the DB file is changed atomically only
+     * if the generate DB file is ok. */
+    //将该临时文件重命名    
+    if (rename(tmpfile,filename) == -1) {
+        char *cwdp = getcwd(cwd,MAXPATHLEN);
+        serverLog(LL_WARNING,
+            "Error moving temp DB file %s on the final "
+            "destination %s (in server root dir %s): %s",
+            tmpfile,
+            filename,
+            cwdp ? cwdp : "unknown",
+            strerror(errno));
+        unlink(tmpfile);
+        return C_ERR;
+    }
+
+    serverLog(LL_NOTICE,"DB saved on disk");
+    server.dirty = 0;
+    server.lastsave = time(NULL);
+    server.lastbgsave_status = C_OK;
+    return C_OK;
+
+  werr:
+    serverLog(LL_WARNING,"Write error saving DB on disk: %s", strerror(errno));
+    fclose(fp);
+    unlink(tmpfile);
+    return C_ERR;
+  }
+  ```   
+  int rdbSaveRio(rio *rdb, int *error, int flags, rdbSaveInfo *rsi) #实际的工作函数写内存数据到文件     
+  **大致流程如下**    
+  1.先写入 REDIS 魔法值，然后是 RDB 文件的版本( rdb_version )，额外辅助信息 ( aux )。辅助信息中包含了 Redis 的版本，内存占用和复制库( repl-id )和偏移量( repl-offset )等。    
+  2.然后 rdbSaveRio 会遍历当前 Redis 的所有数据库，将数据库的信息依次写入。先写入 RDB_OPCODE_SELECTDB识别码和数据库编号，接着写入RDB_OPCODE_RESIZEDB识别码和数据库键值数量和待失效键值数量，最后会遍历所有的键值，依次写入。     
+  3.在写入键值时，当该键值有失效时间时，会先写入RDB_OPCODE_EXPIRETIME_MS识别码和失效时间，然后写入键值类型的识别码，最后再写入键和值。    
+  4.写完数据库信息后，还会把 Lua 相关的信息写入，最后再写入 RDB_OPCODE_EOF结束符识别码和校验值。 
+
+  =================================================================
+
+  rdbSaveRio在写键值时，会调用rdbSaveKeyValuePair 函数。该函数会依次写入键值的过期时间，键的类型，键和值。       
+  根据对象的不同写入不同的值    
+  ![rdb](../Pictures/redis_rdb3.png)      
+
+- 总结    
+  总之redis在进行rdb持久化的过程其实就是一个数据库某个时间节点的快照，将当前状态的数据库数据按一定的格式写入到某一个文件中，可以看到当数据库数据量十分大时没进行一次RDB持久化会相对耗时     
+
+
+
+
+
+
 
 
 

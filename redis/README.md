@@ -36,8 +36,10 @@
 - [encapsulation.md](./encapsulation.md) 主要是一些redis封装类的实现包括:  
   1.对底层io的封装支持内存，文件，多个sockets  rio.h和rio.c    
   
+- [Cli-Server.md](./Cli-Server.md) 主要是客户端和服务端的实现包括：    
+  1.事件驱动模型的实现， ae.h和ae.c  IO复用模型ae_epoll.c,ae_evport.c,ae_kqueue.c和ae_select.c    
   
-   
+    
 
       
   

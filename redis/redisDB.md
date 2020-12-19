@@ -1092,7 +1092,66 @@ redis的通知功能是基于订阅发布的所实现的，听起来好像一脸
   最后，执行清理工作，调用aofClosePipes关闭重写AOF时使用的管道；调用aofRewriteBufferReset重置重写AOF缓存；删除重写AOF临时文件；设置server.aof_child_pid为-1等；   
 
 - 总结    
-  Redis的AOF持久化是从命令的角度去实现的，保存的AOF文件可以阅读，AOF持久化对数据要求准确的任务十分有用    
+  Redis的AOF持久化是从命令的角度去实现的，保存的AOF文件可以阅读，AOF持久化对数据要求准确的任务十分有用      
+
+## 4.mutil事务    
+mutil事务的实现就是Redis通过MULTl，EXEC，WATCH，DISCARD等命令来实现事务（transaction）功能。事务从MULTI命令开始，之后，该客户端发来的其他命令会被排队，客户端发来EXEC命令之后，Redis会依次执行队列中的命令。并且在执行期间，服务器不会中断事务而改去执行其他客户端的命令请求，它会将事务中的所有命令都执行完毕后，然后才去处理其他客户端的命令请求。 WATCH命令，使得客户端可以在EXEC命令执行之前，监视任意数量的数据库键，并在EXEC命令执行时，检查被监视的键是否被其他客户端修改了。如果是的话，Redis将拒绝执行事务，并向客户端返回代表事务执行失败的空回复。DISCARD命令会清空事务队列，并退出事务模式。     
+
+- 设计思想   
+  redis的事务模式的实现是为了多个命令同时执行而且不受外界干扰    
+
+- 源码分析    
+  **multi.c源文件**     
+  在表示客户端的结构体redisClient中，具有一个multiState结构的mstate属性：     
+  ![multi](../Pictures/redis_multi1.png)     
+  multiState结构其实就是一个事务队列，用于保存事务中的命令。multiState结构的定义如下：     
+  ![multi](../Pictures/redis_multi2.png)     
+  multiState中的commands数组属性保存每条命令，使用count标记命令条数。后两个属性没用到。    
+  ```
+  void initClientMultiState(client *c) #初始化一个multiState结构   
+  void freeClientMultiState(client *c) #释放一个multiState结构    
+  void queueMultiCommand(client *c) #将一个命令加入到事务队列中   
+  void discardTransaction(client *c) #取消事务模式的函数
+  void flagTransaction(client *c) #给事务模式添加的命令错误增加一个CLIENT_DIRTY_EXEC标志，当EXEC执行时就不会执行该事务   
+  void multiCommand(client *c) #multi命令，就是简单的把将flags标志增加CLIENT_MULTI   
+  void discardCommand(client *c) #discard命令，取消事务模式，内部调用discardTransaction()函数    
+  void execCommand(redisClient *c) #EXEC命令，执行事务队列中的命令    
+  ```  
+  void execCommand(redisClient *c)函数解析:     
+  1.函数中，如果该客户端当前没有处于事务模式下，则回复客户端错误信息；      
+  2.如果客户端标志位中设置了REDIS_DIRTY_CAS或REDIS_DIRTY_EXEC标记，则回复客户端相应的错误信息，然后调用discardTransaction终止客户端的事务模式，最后给monitor发送消息后直接返回。REDIS_DIRTY_CAS标记表示该客户端WATCH的某个key被修改了；REDIS_DIRTY_EXEC标记表示事务中，某条命令在经过processCommand函数检查时出现了错误，比如找不到该命令，或者命令参数个数出错等。      
+  3.首先调用unwatchAllKeys，设置客户端c不再WATCH任何key；然后记录客户端当前的命令属性到orig_*中，以便后续恢复；     
+  4.接下来，轮训c->mstate中排队的每个命令，依次执行命令。注意：在遇到第一个写操作时，需要调用execCommandPropagateMulti函数，先向从节点和AOF文件追加一个MULTI命令；c->mstate中的命令依次执行，某个命令执行失败，不影响后续命令的执行；     
+  5.最后，将orig_*中记录的命令属性恢复，并调用discardTransaction终止客户端的事务模式；给monitor发送消息后直接返回；     
+  ```
+  ***********************************************WATCH*************************************
+  void watchCommand(client *c) #watch命令    
+  1.在WATCH命令处理函数watchCommand中，如果当前客户端已处于事务模式下，则回复客户端错误信息，然后直接返回；
+  2.接下来，针对命令参数中每一个key，调用watchForKey函数，设置客户端WATCH该key；  
+  3.最后回复客户端"ok"；    
+  void watchForKey(client *c, robj *key) #watch某个key     
+  1.watchForKey函数中，首先轮训列表c->watched_keys，判断当前客户端是否已经WATCH该key了，若是，则直接返回；   
+  2.然后通过key，在字典c->db->watched_keys中查找WATCH该key的客户端列表clients。若找不到，说明还没有客户端WATCH该key，因此创建列表clients，并将key和clients添加到字典
+  c->db->watched_keys中；若找到了，则将当前客户端c追加到列表clients中；
+  3.然后创建一个watchedKey结构的wk，其中记录了该key及其所属的数据库db；然后将wk追加到列表c->watched_keys中； 
+  
+  当某个客户端发来的命令修改了某个key后，都会调用到signalModifiedKey函数。该函数仅仅是调用touchWatchedKey而已。touchWatchedKey函数的作用，就是当数据库db中的key被改变时，增加
+  REDIS_DIRTY_CAS标记到所有WATCH该key的客户端标志位中，这样这些客户端执行EXEC命令时，就会直接回复客户端错误信息。
+  void touchWatchedKey(redisDb *db, robj *key) #更改了某个key    
+  1.函数中，如果字典db->watched_keys为空，则直接返回；     
+  2.然后通过key，在字典db->watched_keys中查找WATCH该key的客户端列表clients，若找不到clients，说明没有客户端WATCH该key，直接返回   
+  3.接下来就是轮训列表clients，向其中每一个客户端的标志位中，增加REDIS_DIRTY_CAS标记。   
+  这样，当WATCH该key的客户端执行EXEC时，发现客户端标志位中设置了REDIS_DIRTY_CAS标记后，就会回复客户端错误信息。   
+  void unwatchCommand(client *c) #同样的取消watch某个key    
+  ```    
+
+- 总结   
+  redis的事务模式就是起到可以原子性同时执行多个任务，提供的某一个功能    
+
+
+
+
+  
 
 
 

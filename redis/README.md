@@ -31,7 +31,7 @@
   1.操作redis数据库命令的实现 db.c     
   2.redis数据库利用订阅发布实现通知功能 pubsub.c和notify.c  
   3.redis数据库的RDB持久化实现   rdb.h,rdb.c和rio.h和rio.c     
-  
+  4.redis的事务模式实现 multi.c         
 
 - [encapsulation.md](./encapsulation.md) 主要是一些redis封装类的实现包括:  
   1.对底层io的封装支持内存，文件，多个sockets  rio.h和rio.c    
